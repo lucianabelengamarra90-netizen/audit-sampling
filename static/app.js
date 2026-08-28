@@ -677,3 +677,13 @@ async function updateExtrapolation() {
         (checks.total_vs_materiality || "sin umbral") +
         '.</p>';
 }
+function formatMoney(value) {
+    const number = Number(value) || 0;
+
+    return new Intl.NumberFormat("es-AR", {
+        style: "currency",
+        currency: "ARS",
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+    }).format(number);
+}
