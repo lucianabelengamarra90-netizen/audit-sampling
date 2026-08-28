@@ -1,80 +1,193 @@
 <!doctype html>
 <html lang="es">
+
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Audit Sampling & Extrapolation</title>
-    <link rel="stylesheet" href="/static/styles.css">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
+    <title>
+        Audit Sampling & Extrapolation
+    </title>
+
+    <link
+        rel="stylesheet"
+        href="/static/styles.css"
+    >
 </head>
+
 
 <body>
 
+
+<!-- ===================================================== -->
+<!-- HEADER -->
+<!-- ===================================================== -->
+
 <header class="header">
+
     <div class="header-content">
+
         <div>
-            <h1 class="app-title">Audit Sampling & Extrapolation</h1>
-            <p class="app-subtitle">Herramienta de Muestreo de Auditoría</p>
+
+            <h1 class="app-title">
+                Audit Sampling & Extrapolation
+            </h1>
+
+            <p class="app-subtitle">
+                Herramienta de Muestreo de Auditoría
+            </p>
+
         </div>
 
-        <span class="project-status" id="fileStatus">
+
+        <span
+            class="project-status"
+            id="fileStatus"
+        >
             Sin población cargada
         </span>
+
     </div>
+
 </header>
 
+
+<!-- ===================================================== -->
+<!-- NAVEGACIÓN -->
+<!-- ===================================================== -->
+
 <nav class="main-nav">
+
     <div class="nav-container">
-        <button class="nav-tab active" data-tab="poblacion">Población</button>
-        <button class="nav-tab" data-tab="diseno">Diseño</button>
-        <button class="nav-tab" data-tab="muestra">Muestra</button>
-        <button class="nav-tab" data-tab="resultados">Resultados</button>
-        <button class="nav-tab" data-tab="extrapolacion">Extrapolación</button>
-        <button class="nav-tab" data-tab="resumen">Resumen</button>
+
+        <button
+            class="nav-tab active"
+            data-tab="poblacion"
+        >
+            Población
+        </button>
+
+        <button
+            class="nav-tab"
+            data-tab="diseno"
+        >
+            Diseño
+        </button>
+
+        <button
+            class="nav-tab"
+            data-tab="muestra"
+        >
+            Muestra
+        </button>
+
+        <button
+            class="nav-tab"
+            data-tab="resultados"
+        >
+            Resultados
+        </button>
+
+        <button
+            class="nav-tab"
+            data-tab="extrapolacion"
+        >
+            Extrapolación
+        </button>
+
+        <button
+            class="nav-tab"
+            data-tab="resumen"
+        >
+            Resumen
+        </button>
+
     </div>
+
 </nav>
 
+
+
 <main class="main-content">
+
 
 <!-- ===================================================== -->
 <!-- POBLACIÓN -->
 <!-- ===================================================== -->
 
-<section id="poblacion" class="tab-content active">
+<section
+    id="poblacion"
+    class="tab-content active"
+>
 
     <div class="page-intro">
-        <span class="section-eyebrow">PASO 1</span>
-        <h2>Carga y análisis de población</h2>
+
+        <span class="section-eyebrow">
+            PASO 1
+        </span>
+
+        <h2>
+            Carga y análisis de población
+        </h2>
+
         <p>
-            Cargá la base, identificá las columnas relevantes y obtené una visión inicial del universo a auditar.
+            Cargá la base, identificá las columnas relevantes
+            y obtené una visión inicial del universo a auditar.
         </p>
+
     </div>
+
+
 
     <div class="card hero-upload-card">
 
         <div class="section-heading">
+
             <div>
-                <h2>Población</h2>
+
+                <h2>
+                    Población
+                </h2>
+
                 <p class="section-description">
-                    Importá la población completa en formato Excel o CSV para iniciar el proceso de muestreo.
+                    Importá la población completa en formato Excel
+                    o CSV para iniciar el proceso de muestreo.
                 </p>
+
             </div>
+
 
             <span class="info-badge statistical">
                 BASE DE DATOS
             </span>
+
         </div>
 
-        <div class="upload-area upload-area-large" id="drop">
 
-            <div class="upload-icon">📁</div>
+
+        <div
+            class="upload-area upload-area-large"
+            id="drop"
+        >
+
+            <div class="upload-icon">
+                📁
+            </div>
 
             <p class="upload-text">
-                Arrastrá un archivo Excel/CSV o hacé clic para seleccionarlo
+                Arrastrá un archivo Excel/CSV
+                o hacé clic para seleccionarlo
             </p>
 
             <p class="upload-hint">
-                Compatible con poblaciones superiores a 10.000 registros
+                Compatible con poblaciones superiores
+                a 10.000 registros
             </p>
+
 
             <input
                 id="file"
@@ -85,10 +198,17 @@
 
         </div>
 
-        <div id="msg" class="upload-message"></div>
+
+        <div
+            id="msg"
+            class="upload-message"
+        ></div>
 
     </div>
 
+
+
+    <!-- MAPEO -->
 
     <div
         class="card mapping-card"
@@ -99,12 +219,18 @@
         <div class="section-heading">
 
             <div>
-                <h2>Mapeo de columnas</h2>
+
+                <h2>
+                    Mapeo de columnas
+                </h2>
 
                 <p class="section-description">
-                    Indicá qué representa cada campo de la base. ID e Importe son obligatorios para continuar.
+                    Indicá qué representa cada campo de la base.
+                    ID e Importe son obligatorios para continuar.
                 </p>
+
             </div>
+
 
             <span class="info-badge monetary">
                 CONFIGURACIÓN
@@ -113,36 +239,60 @@
         </div>
 
 
+
         <div class="mapping-helper">
 
+
             <div class="mapping-helper-item">
-                <strong>ID</strong>
+
+                <strong>
+                    ID
+                </strong>
+
                 <span>
                     Identificador único del registro.
                 </span>
+
             </div>
 
-            <div class="mapping-helper-item">
-                <strong>Importe</strong>
-                <span>
-                    Campo monetario utilizado para análisis y muestreo.
-                </span>
-            </div>
 
             <div class="mapping-helper-item">
-                <strong>Otros campos</strong>
+
+                <strong>
+                    Importe
+                </strong>
+
                 <span>
-                    Son opcionales y aportan contexto a la muestra.
+                    Campo monetario utilizado para análisis
+                    y muestreo.
                 </span>
+
             </div>
+
+
+            <div class="mapping-helper-item">
+
+                <strong>
+                    Otros campos
+                </strong>
+
+                <span>
+                    Son opcionales y aportan contexto
+                    a la muestra.
+                </span>
+
+            </div>
+
 
         </div>
+
 
 
         <div
             class="mapping-grid pretty-mapping-grid"
             id="mapping"
         ></div>
+
 
 
         <div class="mapping-actions">
@@ -159,28 +309,38 @@
     </div>
 
 
+
+    <!-- RESULTADOS POBLACIÓN -->
+
     <div
         id="populationResults"
         style="display:none"
     >
+
 
         <div class="card">
 
             <div class="section-heading compact">
 
                 <div>
-                    <h2>Indicadores generales</h2>
+
+                    <h2>
+                        Indicadores generales
+                    </h2>
 
                     <p class="section-description">
                         Resumen cuantitativo de la población cargada.
                     </p>
+
                 </div>
+
 
                 <span class="info-badge statistical">
                     ANÁLISIS
                 </span>
 
             </div>
+
 
             <div
                 class="dashboard-grid"
@@ -190,19 +350,27 @@
         </div>
 
 
+
         <div class="card">
 
             <div class="section-heading compact">
 
                 <div>
-                    <h2>Calidad y concentración</h2>
+
+                    <h2>
+                        Calidad y concentración
+                    </h2>
 
                     <p class="section-description">
-                        Indicadores para detectar valores atípicos, concentración monetaria y posibles riesgos en la población.
+                        Indicadores para detectar valores atípicos,
+                        concentración monetaria y posibles riesgos
+                        en la población.
                     </p>
+
                 </div>
 
             </div>
+
 
             <div
                 class="quality-grid"
@@ -212,26 +380,40 @@
         </div>
 
 
+
         <div class="card">
 
             <div class="section-heading compact">
 
                 <div>
-                    <h2>Vista previa</h2>
+
+                    <h2>
+                        Vista previa
+                    </h2>
 
                     <p class="section-description">
-                        Se muestran algunas filas a modo de referencia. La herramienta procesa la población completa.
+                        Se muestran algunas filas a modo de referencia.
+                        La herramienta procesa la población completa.
                     </p>
+
                 </div>
 
             </div>
 
+
             <div class="preview-note">
-                <span>Vista parcial</span>
+
+                <span>
+                    Vista parcial
+                </span>
+
                 <em>
-                    La cantidad de filas visibles no limita el análisis ni el cálculo de la muestra.
+                    La cantidad de filas visibles no limita
+                    el análisis ni el cálculo de la muestra.
                 </em>
+
             </div>
+
 
             <div class="table-container">
 
@@ -244,57 +426,95 @@
 
         </div>
 
+
     </div>
 
 </section>
+
 
 
 <!-- ===================================================== -->
 <!-- DISEÑO -->
 <!-- ===================================================== -->
 
-<section id="diseno" class="tab-content">
+<section
+    id="diseno"
+    class="tab-content"
+>
 
     <div class="page-intro">
-        <span class="section-eyebrow">PASO 2</span>
-        <h2>Diseño de la muestra</h2>
+
+        <span class="section-eyebrow">
+            PASO 2
+        </span>
+
+        <h2>
+            Diseño de la muestra
+        </h2>
+
         <p>
-            Definí los parámetros estadísticos, la materialidad
-            y el método de selección más adecuado.
+            Definí los parámetros estadísticos,
+            la materialidad y el método de selección
+            más adecuado.
         </p>
+
     </div>
 
 
+
+    <!-- ================================================= -->
     <!-- A. TAMAÑO -->
+    <!-- ================================================= -->
 
     <div class="card">
 
         <div class="section-heading">
+
             <div>
-                <h2>A. Tamaño de muestra</h2>
+
+                <h2>
+                    A. Tamaño de muestra
+                </h2>
+
                 <p class="section-description">
-                    Parámetros utilizados para determinar la cantidad de registros a revisar.
+                    Parámetros utilizados para determinar
+                    la cantidad de registros a revisar.
                 </p>
+
             </div>
+
 
             <span class="info-badge statistical">
                 ESTADÍSTICO
             </span>
+
         </div>
+
 
 
         <div class="recommendation-strip">
-            <strong>Configuración sugerida</strong>
+
+            <strong>
+                Configuración sugerida
+            </strong>
+
             <span>
-                95% de confianza · 5% de margen de error · p = 0,50 cuando no exista información histórica.
+                95% de confianza · 5% de margen de error ·
+                p = 0,50 cuando no exista información histórica.
             </span>
+
         </div>
+
 
 
         <div class="form-grid sample-config-grid">
 
+
             <div class="form-group">
-                <label>Población N</label>
+
+                <label>
+                    Población N
+                </label>
 
                 <input
                     id="N"
@@ -303,29 +523,61 @@
                 >
 
                 <small class="field-help">
-                    Cantidad total de registros. Se completa automáticamente.
+                    Cantidad total de registros.
+                    Se completa automáticamente.
                 </small>
+
             </div>
 
 
-            <div class="form-group">
-                <label>Confianza</label>
 
-                <select id="confidence" class="form-input">
-                    <option value="90">90% (Z=1.645)</option>
-                    <option value="95" selected>95% (Z=1.96)</option>
-                    <option value="97">97% (Z=2.17)</option>
-                    <option value="99">99% (Z=2.576)</option>
+            <div class="form-group">
+
+                <label>
+                    Confianza
+                </label>
+
+                <select
+                    id="confidence"
+                    class="form-input"
+                >
+
+                    <option value="90">
+                        90% (Z=1.645)
+                    </option>
+
+                    <option
+                        value="95"
+                        selected
+                    >
+                        95% (Z=1.96)
+                    </option>
+
+                    <option value="97">
+                        97% (Z=2.17)
+                    </option>
+
+                    <option value="99">
+                        99% (Z=2.576)
+                    </option>
+
                 </select>
 
+
                 <small class="field-help">
-                    95% es recomendado para pruebas de auditoría estándar. Mayor confianza implica mayor muestra.
+                    95% es recomendado para pruebas de auditoría estándar.
+                    Mayor confianza implica mayor muestra.
                 </small>
+
             </div>
 
 
+
             <div class="form-group">
-                <label>Margen de error e</label>
+
+                <label>
+                    Margen de error e
+                </label>
 
                 <input
                     id="error"
@@ -338,13 +590,19 @@
                 >
 
                 <small class="field-help">
-                    5% es un criterio general. Un margen menor genera una muestra mayor.
+                    5% es un criterio general.
+                    Un margen menor genera una muestra mayor.
                 </small>
+
             </div>
 
 
+
             <div class="form-group">
-                <label>p</label>
+
+                <label>
+                    p
+                </label>
 
                 <input
                     id="p"
@@ -357,13 +615,19 @@
                 >
 
                 <small class="field-help">
-                    Use 0,50 si desconoce la tasa esperada de error. Es el supuesto más conservador.
+                    Use 0,50 si desconoce la tasa esperada de error.
+                    Es el supuesto más conservador.
                 </small>
+
             </div>
 
 
+
             <div class="form-group">
-                <label>q</label>
+
+                <label>
+                    q
+                </label>
 
                 <input
                     id="q"
@@ -374,26 +638,34 @@
                 <small class="field-help">
                     Se calcula automáticamente como 1 − p.
                 </small>
+
             </div>
 
         </div>
 
 
+
         <div class="sample-result-box">
 
             <div>
+
                 <span class="result-caption">
                     Tamaño recomendado
                 </span>
 
-                <strong id="nResult" class="result-number">
+                <strong
+                    id="nResult"
+                    class="result-number"
+                >
                     -
                 </strong>
 
                 <span class="result-unit">
                     registros
                 </span>
+
             </div>
+
 
             <button
                 id="howSample"
@@ -407,18 +679,28 @@
     </div>
 
 
+
+    <!-- ================================================= -->
     <!-- B. MATERIALIDAD -->
+    <!-- ================================================= -->
 
     <div class="card">
 
         <div class="section-heading">
 
             <div>
-                <h2>B. Materialidad</h2>
+
+                <h2>
+                    B. Materialidad
+                </h2>
+
                 <p class="section-description">
-                    Definí qué importes requieren mayor atención dentro de la población.
+                    Definí qué importes requieren mayor atención
+                    dentro de la población.
                 </p>
+
             </div>
+
 
             <span class="info-badge monetary">
                 MONETARIO
@@ -427,7 +709,9 @@
         </div>
 
 
+
         <div class="form-grid materiality-grid">
+
 
             <div class="form-group">
 
@@ -443,10 +727,12 @@
                 >
 
                 <small class="field-help">
-                    Monto a partir del cual un error podría ser relevante para la auditoría.
+                    Monto a partir del cual un error podría ser
+                    relevante para la auditoría.
                 </small>
 
             </div>
+
 
 
             <div class="form-group">
@@ -463,10 +749,12 @@
                 >
 
                 <small class="field-help">
-                    Error máximo aceptable en la población sin afectar la conclusión.
+                    Error máximo aceptable en la población
+                    sin afectar la conclusión.
                 </small>
 
             </div>
+
 
 
             <div class="form-group">
@@ -483,35 +771,48 @@
                 >
 
                 <small class="field-help">
-                    Importe desde el cual una partida se revisa al 100%.
+                    Importe desde el cual una partida
+                    se revisa al 100%.
                 </small>
 
             </div>
+
 
         </div>
 
     </div>
 
 
+
+    <!-- ================================================= -->
     <!-- C. MÉTODO -->
+    <!-- ================================================= -->
 
     <div class="card">
 
         <div class="section-heading">
 
             <div>
-                <h2>C. Método de selección</h2>
+
+                <h2>
+                    C. Método de selección
+                </h2>
 
                 <p class="section-description">
-                    Elegí cómo se seleccionarán los registros del universo residual.
+                    Elegí cómo se seleccionarán los registros
+                    del universo residual.
                 </p>
+
             </div>
 
         </div>
 
 
+
         <div class="method-grid method-cards">
 
+
+            <!-- ALEATORIO -->
 
             <label class="method-option">
 
@@ -529,10 +830,12 @@
                     </div>
 
                     <p class="method-description">
-                        Todos los registros tienen la misma probabilidad. Útil para poblaciones homogéneas.
+                        Todos los registros tienen la misma probabilidad.
+                        Útil para poblaciones homogéneas.
                     </p>
 
                     <div class="method-tags">
+
                         <span class="method-tag statistical">
                             ESTADÍSTICO
                         </span>
@@ -540,12 +843,16 @@
                         <span class="method-tag extrapolable">
                             EXTRAPOLABLE
                         </span>
+
                     </div>
 
                 </div>
 
             </label>
 
+
+
+            <!-- SISTEMÁTICO -->
 
             <label class="method-option">
 
@@ -562,7 +869,8 @@
                     </div>
 
                     <p class="method-description">
-                        Selecciona cada N registros. Útil para bases extensas y ordenadas.
+                        Selecciona cada N registros.
+                        Útil para bases extensas y ordenadas.
                     </p>
 
                     <div class="method-tags">
@@ -581,6 +889,9 @@
 
             </label>
 
+
+
+            <!-- ESTRATIFICADO -->
 
             <label class="method-option">
 
@@ -597,7 +908,8 @@
                     </div>
 
                     <p class="method-description">
-                        Divide la población por rangos. Recomendado cuando los importes son muy dispersos.
+                        Divide la población por rangos.
+                        Recomendado cuando los importes son muy dispersos.
                     </p>
 
                     <div class="method-tags">
@@ -617,6 +929,9 @@
             </label>
 
 
+
+            <!-- MUS -->
+
             <label class="method-option">
 
                 <input
@@ -632,7 +947,8 @@
                     </div>
 
                     <p class="method-description">
-                        Da mayor probabilidad a partidas de mayor importe. Útil en auditoría financiera.
+                        Da mayor probabilidad a partidas de mayor importe.
+                        Útil en auditoría financiera.
                     </p>
 
                     <div class="method-tags">
@@ -652,6 +968,9 @@
             </label>
 
 
+
+            <!-- TOP N -->
+
             <label class="method-option">
 
                 <input
@@ -667,7 +986,8 @@
                     </div>
 
                     <p class="method-description">
-                        Selecciona los importes más altos. Es una selección dirigida.
+                        Selecciona los importes más altos.
+                        Es una selección dirigida.
                     </p>
 
                     <div class="method-tags">
@@ -686,12 +1006,17 @@
 
             </label>
 
+
         </div>
 
 
+
+        <!-- ================================================= -->
         <!-- INCLUSIONES 100% -->
+        <!-- ================================================= -->
 
         <div class="selection-rules">
+
 
             <div class="selection-rule">
 
@@ -710,10 +1035,12 @@
                 </label>
 
                 <small class="field-help">
-                    Incluye automáticamente las partidas que superan el umbral definido.
+                    Incluye automáticamente las partidas
+                    que superan el umbral definido.
                 </small>
 
             </div>
+
 
 
             <div class="selection-rule">
@@ -733,17 +1060,23 @@
                 </label>
 
                 <small class="field-help">
-                    Incluye automáticamente los valores atípicos detectados por la herramienta.
+                    Incluye automáticamente los valores atípicos
+                    detectados por la herramienta.
                 </small>
 
             </div>
 
+
         </div>
 
 
+
+        <!-- ================================================= -->
         <!-- ACCIONES -->
+        <!-- ================================================= -->
 
         <div class="method-actions">
+
 
             <button
                 id="recommend"
@@ -760,7 +1093,9 @@
                 Generar muestra
             </button>
 
+
         </div>
+
 
 
         <div
@@ -769,42 +1104,63 @@
             style="display:none"
         ></div>
 
+
     </div>
 
 </section>
+
 
 
 <!-- ===================================================== -->
 <!-- MUESTRA -->
 <!-- ===================================================== -->
 
-<section id="muestra" class="tab-content">
+<section
+    id="muestra"
+    class="tab-content"
+>
 
     <div class="card">
+
 
         <div class="section-heading">
 
             <div>
-                <span class="section-eyebrow">PASO 3</span>
-                <h2>Muestra seleccionada</h2>
+
+                <span class="section-eyebrow">
+                    PASO 3
+                </span>
+
+                <h2>
+                    Muestra seleccionada
+                </h2>
 
                 <p class="section-description">
-                    Registros seleccionados según los parámetros y criterios definidos.
+                    Registros seleccionados según los parámetros
+                    y criterios definidos.
                 </p>
+
             </div>
 
         </div>
+
+
 
         <div
             class="sample-summary"
             id="sampleSummary"
         ></div>
 
+
+
+        <!-- REPETIR SELECCIÓN -->
+
         <div
             id="repeatArea"
             class="repeat-area"
             style="display:none"
         >
+
             <button
                 class="btn btn-secondary"
                 id="repeatSelection"
@@ -812,56 +1168,259 @@
                 Repetir selección
             </button>
 
+
             <em>
-                Reproduce la misma muestra usando el mismo Código de selección,
-                siempre que la población y los parámetros no hayan cambiado.
+                Reproduce la misma muestra usando el mismo
+                Código de selección, siempre que la población
+                y los parámetros no hayan cambiado.
             </em>
+
         </div>
 
+
+
         <div class="table-container">
+
             <table
                 id="sampleTable"
                 class="data-table"
             ></table>
+
         </div>
+
 
     </div>
 
 </section>
 
 
+
 <!-- ===================================================== -->
 <!-- RESULTADOS -->
 <!-- ===================================================== -->
 
-<section id="resultados" class="tab-content">
+<section
+    id="resultados"
+    class="tab-content"
+>
 
     <div class="card">
 
+
         <div class="section-heading">
 
+
             <div>
-                <span class="section-eyebrow">PASO 4</span>
-                <h2>Resultados de auditoría</h2>
+
+                <span class="section-eyebrow">
+                    PASO 4
+                </span>
+
+                <h2>
+                    Resultados de auditoría
+                </h2>
 
                 <p class="section-description">
-                    Registrá las excepciones y diferencias identificadas durante la revisión.
+                    Registrá el resultado de la revisión de cada
+                    partida seleccionada. Completá únicamente los
+                    campos de auditoría; los datos originales de
+                    la muestra no deben modificarse.
                 </p>
+
             </div>
+
+
+            <span class="info-badge monetary">
+                REVISIÓN
+            </span>
+
 
         </div>
 
+
+
+        <!-- ================================================= -->
+        <!-- GUÍA DE CAMPOS -->
+        <!-- ================================================= -->
+
+        <div class="results-guide">
+
+
+            <div>
+
+                <strong>
+                    Resultado de revisión
+                </strong>
+
+                <em>
+                    Indicá si el registro fue validado sin diferencias
+                    o si presenta una excepción.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Importe registrado
+                </strong>
+
+                <em>
+                    Valor informado originalmente en la población.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Importe validado
+                </strong>
+
+                <em>
+                    Valor determinado como correcto según la
+                    documentación o evidencia revisada.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Diferencia
+                </strong>
+
+                <em>
+                    Se calcula automáticamente como Importe registrado
+                    menos Importe validado.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Tipo de excepción
+                </strong>
+
+                <em>
+                    Clasificación del desvío detectado
+                    durante la revisión.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Comentario del auditor
+                </strong>
+
+                <em>
+                    Breve descripción del hallazgo,
+                    diferencia o validación realizada.
+                </em>
+
+            </div>
+
+
+
+            <div>
+
+                <strong>
+                    Referencia de evidencia
+                </strong>
+
+                <em>
+                    Factura, OC, ticket, documento SAP,
+                    archivo u otra evidencia utilizada.
+                </em>
+
+            </div>
+
+
+        </div>
+
+
+
+        <!-- ================================================= -->
+        <!-- INDICADORES -->
+        <!-- ================================================= -->
+
         <div
-            class="results-dashboard"
+            class="results-dashboard result-dashboard"
             id="resultsDash"
         ></div>
 
+
+
+        <!-- ================================================= -->
+        <!-- EXCEL -->
+        <!-- ================================================= -->
+
+        <div class="result-buttons">
+
+
+            <button
+                id="downloadReview"
+                class="btn btn-secondary"
+                type="button"
+            >
+                Descargar hoja de revisión
+            </button>
+
+
+
+            <button
+                id="importReview"
+                class="btn btn-secondary"
+                type="button"
+            >
+                Importar resultados desde Excel
+            </button>
+
+
+
+            <input
+                id="reviewFile"
+                type="file"
+                accept=".xlsx"
+                hidden
+            >
+
+
+        </div>
+
+
+
+        <!-- ================================================= -->
+        <!-- TABLA -->
+        <!-- ================================================= -->
+
         <div class="table-container">
+
             <table
                 id="resultsTable"
-                class="data-table"
+                class="data-table results-table"
             ></table>
+
         </div>
+
+
+
+        <!-- ================================================= -->
+        <!-- GUARDAR -->
+        <!-- ================================================= -->
 
         <button
             id="saveResults"
@@ -871,37 +1430,57 @@
             Guardar resultados
         </button>
 
+
     </div>
 
 </section>
+
 
 
 <!-- ===================================================== -->
 <!-- EXTRAPOLACIÓN -->
 <!-- ===================================================== -->
 
-<section id="extrapolacion" class="tab-content">
+<section
+    id="extrapolacion"
+    class="tab-content"
+>
 
     <div class="card">
+
 
         <div class="section-heading">
 
             <div>
-                <span class="section-eyebrow">PASO 5</span>
-                <h2>Extrapolación</h2>
+
+                <span class="section-eyebrow">
+                    PASO 5
+                </span>
+
+                <h2>
+                    Extrapolación
+                </h2>
 
                 <p class="section-description">
-                    Evaluación del error observado y, cuando corresponda,
-                    proyección sobre el universo residual.
+                    Evaluación del error observado y,
+                    cuando corresponda, proyección sobre
+                    el universo residual.
                 </p>
+
             </div>
 
         </div>
 
+
+
         <div id="extraWarning"></div>
 
 
+
         <div class="extrapolation-grid">
+
+
+            <!-- OBSERVADO -->
 
             <div class="extrapolation-section">
 
@@ -918,6 +1497,9 @@
             </div>
 
 
+
+            <!-- PROYECTADO -->
+
             <div class="extrapolation-section">
 
                 <span class="result-type projected">
@@ -932,7 +1514,9 @@
 
             </div>
 
+
         </div>
+
 
 
         <button
@@ -943,30 +1527,42 @@
             Actualizar resultados
         </button>
 
+
     </div>
 
 </section>
+
 
 
 <!-- ===================================================== -->
 <!-- RESUMEN -->
 <!-- ===================================================== -->
 
-<section id="resumen" class="tab-content">
+<section
+    id="resumen"
+    class="tab-content"
+>
 
     <div class="card">
+
 
         <div class="section-heading">
 
             <div>
-                <span class="section-eyebrow">PASO 6</span>
+
+                <span class="section-eyebrow">
+                    PASO 6
+                </span>
+
 
                 <h2>
                     Resumen ejecutivo
                 </h2>
 
+
                 <p class="section-description">
-                    Síntesis de cobertura, excepciones y resultados de la muestra.
+                    Síntesis de cobertura, excepciones
+                    y resultados de la muestra.
                 </p>
 
             </div>
@@ -974,10 +1570,12 @@
         </div>
 
 
+
         <div
             class="executive-dashboard"
             id="summary"
         ></div>
+
 
 
         <div class="conclusion-card">
@@ -987,34 +1585,47 @@
             </h3>
 
             <p id="conclusion">
-                Genere y evalúe la muestra para obtener el resumen.
+                Genere y evalúe la muestra
+                para obtener el resumen.
             </p>
 
         </div>
 
 
+
         <a
             class="btn btn-primary btn-large"
             href="/api/export"
-            style="margin-top:20px;display:inline-block;text-decoration:none"
+            style="
+                margin-top:20px;
+                display:inline-block;
+                text-decoration:none;
+            "
         >
             Exportar papel de trabajo
         </a>
+
 
     </div>
 
 </section>
 
+
 </main>
+
 
 
 <!-- ===================================================== -->
 <!-- MODAL -->
 <!-- ===================================================== -->
 
-<div id="modal" class="modal">
+<div
+    id="modal"
+    class="modal"
+>
 
     <div class="modal-content">
+
 
         <div class="modal-header">
 
@@ -1022,22 +1633,34 @@
                 Cómo se calculó
             </h3>
 
+
             <button class="modal-close">
                 &times;
             </button>
 
         </div>
 
+
+
         <div
             id="modalText"
             class="modal-body"
         ></div>
 
+
     </div>
 
 </div>
 
+
+
+<!-- ===================================================== -->
+<!-- JAVASCRIPT -->
+<!-- ===================================================== -->
+
 <script src="/static/app.js"></script>
 
+
 </body>
+
 </html>
