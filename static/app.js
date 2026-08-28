@@ -1,6 +1,10 @@
 // Audit Sampling & Extrapolation - Frontend
 
-let population = null, mapping = {}, sample = [], results = {};
+let population = null,
+    mapping = {},
+    sample = [],
+    results = {},
+    lastSelectionCode = null;
 
 document.querySelectorAll(".nav-tab").forEach(t => t.onclick = () => {
     document.querySelectorAll(".nav-tab").forEach(x => x.classList.remove("active"));
@@ -293,7 +297,12 @@ document.getElementById("recommend").onclick = async () => {
         '</ul>';
 };
 
-document.getElementById("generate").onclick = async () => {
+
+/* =========================================================
+   GENERACIÓN Y REPRODUCCIÓN DE LA MUESTRA
+   ========================================================= */
+
+async function generateSample(selectionCode = null, isRepeat = false) {
 
     if (!mapping.id || !mapping.amount) {
         alert("Analice la población primero");
@@ -320,10 +329,23 @@ document.getElementById("generate").onclick = async () => {
 
     const j = await r.json();
 
+    if (j.error) {
+        alert(j.error);
+        return;
+    }
+
     document.getElementById("nResult").textContent = j.n;
 
     const method =
         document.querySelector('input[name="method"]:checked').value;
+
+    const methodLabels = {
+        random: "Aleatorio simple",
+        systematic: "Sistemático",
+        stratified: "Estratificado",
+        mus: "MUS / PPS",
+        topn: "Top N"
+    };
 
     const payload = {
         id_col: mapping.id,
@@ -333,15 +355,25 @@ document.getElementById("generate").onclick = async () => {
         confidence: conf,
         error: e,
         p,
-        seed: Date.now(),
+
+        // Muestra nueva = código nuevo.
+        // Repetir selección = mismo código.
+        seed: selectionCode !== null
+            ? selectionCode
+            : Date.now(),
+
         include_materiality:
             document.getElementById("incMat").checked,
+
         include_outliers:
             document.getElementById("incOut").checked,
+
         significant_threshold:
             parseFloat(document.getElementById("threshold").value) || 0,
+
         materiality:
             parseFloat(document.getElementById("materiality").value) || 0,
+
         tolerable_error:
             parseFloat(document.getElementById("tolerable").value) || 0
     };
@@ -356,31 +388,115 @@ document.getElementById("generate").onclick = async () => {
 
     const sj = await s.json();
 
+    if (sj.error) {
+        alert(sj.error);
+        return;
+    }
+
     sample = sj.preview || [];
 
+    // Internamente sigue siendo la seed.
+    // Para el usuario se muestra como Código de selección.
+    lastSelectionCode = sj.seed;
+
+    if (!isRepeat) {
+        results = {};
+    }
+
     document.getElementById("sampleSummary").innerHTML =
+
         '<div class="summary-item">' +
             '<span class="summary-label">Tamaño</span>' +
-            '<span class="summary-value">' + (sj.rows || 0) + '</span>' +
+            '<span class="summary-value">' +
+            (sj.rows || 0) +
+            '</span>' +
         '</div>' +
 
         '<div class="summary-item">' +
-            '<span class="summary-label">Cobertura %</span>' +
+            '<span class="summary-label">Cobertura registros</span>' +
             '<span class="summary-value">' +
             (sj.coverage_count || 0).toFixed(2) +
             '%</span>' +
         '</div>' +
 
         '<div class="summary-item">' +
-            '<span class="summary-label">Semilla</span>' +
-            '<span class="summary-value">' + sj.seed + '</span>' +
+            '<span class="summary-label">Cobertura monetaria</span>' +
+            '<span class="summary-value">' +
+            (sj.coverage_amount || 0).toFixed(2) +
+            '%</span>' +
+        '</div>' +
+
+        '<div class="summary-item code-pill">' +
+            '<span class="summary-label">Código de selección</span>' +
+            '<span class="summary-value">' +
+            lastSelectionCode +
+            '</span>' +
+        '</div>' +
+
+        '<div class="summary-item">' +
+            '<span class="summary-label">Método</span>' +
+            '<span class="summary-value">' +
+            (methodLabels[method] || method) +
+            '</span>' +
         '</div>';
+
+    const repeatArea = document.getElementById("repeatArea");
+
+    if (repeatArea) {
+        repeatArea.style.display = "flex";
+    }
 
     renderSampleTable();
     renderResultsTable();
 
-    alert("Muestra: " + sj.rows + " registros");
+    if (isRepeat) {
+        alert(
+            "Selección reproducida correctamente.\n" +
+            "Código de selección: " +
+            lastSelectionCode
+        );
+    } else {
+        alert(
+            "Muestra: " +
+            sj.rows +
+            " registros"
+        );
+    }
+}
+
+
+// GENERAR MUESTRA NUEVA
+
+document.getElementById("generate").onclick = async () => {
+    await generateSample(null, false);
 };
+
+
+// REPETIR LA MISMA SELECCIÓN
+
+const repeatSelectionButton =
+    document.getElementById("repeatSelection");
+
+if (repeatSelectionButton) {
+
+    repeatSelectionButton.onclick = async () => {
+
+        if (!lastSelectionCode) {
+            alert("Primero genere una muestra.");
+            return;
+        }
+
+        await generateSample(
+            lastSelectionCode,
+            true
+        );
+    };
+}
+
+
+/* =========================================================
+   TABLA DE MUESTRA
+   ========================================================= */
 
 function renderSampleTable() {
 
@@ -405,6 +521,12 @@ function renderSampleTable() {
         "</tbody>";
 }
 
+
+/* =========================================================
+   RESULTADOS
+   POR AHORA QUEDA EXACTAMENTE COMO ESTABA
+   ========================================================= */
+
 function renderResultsTable() {
 
     if (!sample.length) return;
@@ -426,7 +548,11 @@ function renderResultsTable() {
 
         sample.map((row, i) => {
 
-            const orig = row._original_index || i;
+            const orig =
+                row._original_index !== undefined
+                    ? row._original_index
+                    : i;
+
             const res = results[orig] || {};
 
             return "<tr>" +
@@ -494,42 +620,64 @@ function renderResultsTable() {
     document
         .querySelectorAll(".res-status")
         .forEach(sel => sel.onchange = () => {
+
             const idx = sel.dataset.idx;
-            results[idx] = results[idx] || {};
-            results[idx].status = sel.value;
+
+            results[idx] =
+                results[idx] || {};
+
+            results[idx].status =
+                sel.value;
         });
 }
 
+
 function calcDiff(e) {
 
-    const idx = e.target.dataset.idx;
+    const idx =
+        e.target.dataset.idx;
 
     const aud =
         parseFloat(
             document.querySelector(
-                '.res-audited[data-idx="' + idx + '"]'
+                '.res-audited[data-idx="' +
+                idx +
+                '"]'
             ).value
         ) || 0;
 
     const cor =
         parseFloat(
             document.querySelector(
-                '.res-correct[data-idx="' + idx + '"]'
+                '.res-correct[data-idx="' +
+                idx +
+                '"]'
             ).value
         ) || 0;
 
-    const diff = aud - cor;
+    const diff =
+        aud - cor;
 
     document.querySelector(
-        '.res-diff[data-idx="' + idx + '"]'
-    ).textContent = diff.toFixed(2);
+        '.res-diff[data-idx="' +
+        idx +
+        '"]'
+    ).textContent =
+        diff.toFixed(2);
 
-    results[idx] = results[idx] || {};
+    results[idx] =
+        results[idx] || {};
 
-    results[idx].audited = aud;
-    results[idx].correct = cor;
-    results[idx].difference = diff;
+    results[idx].audited =
+        aud;
+
+    results[idx].correct =
+        cor;
+
+    results[idx].difference =
+        diff;
 }
+
 
 document.getElementById("saveResults").onclick = async () => {
 
@@ -555,71 +703,114 @@ document.getElementById("saveResults").onclick = async () => {
     updateExtrapolation();
 };
 
-document.getElementById("refreshExtra").onclick = updateExtrapolation;
+
+/* =========================================================
+   EXTRAPOLACIÓN
+   POR AHORA QUEDA COMO ESTABA
+   ========================================================= */
+
+document.getElementById("refreshExtra").onclick =
+    updateExtrapolation;
+
 
 async function updateExtrapolation() {
 
-    const r = await fetch("/api/extrapolation");
-    const j = await r.json();
+    const r =
+        await fetch("/api/extrapolation");
+
+    const j =
+        await r.json();
 
     if (j.error) {
-        document.getElementById("extraWarning").innerHTML =
+
+        document.getElementById(
+            "extraWarning"
+        ).innerHTML =
             '<div class="warning-box">' +
             j.error +
             '</div>';
+
         return;
     }
 
-    document.getElementById("extraWarning").innerHTML =
+    document.getElementById(
+        "extraWarning"
+    ).innerHTML =
         j.message
-            ? '<div class="warning-box">' + j.message + '</div>'
+            ? '<div class="warning-box">' +
+              j.message +
+              '</div>'
             : "";
 
-    document.getElementById("observed").innerHTML =
+    document.getElementById(
+        "observed"
+    ).innerHTML =
+
         '<div class="obs-item">' +
             '<span class="obs-label">Error 100%</span>' +
             '<span class="obs-value">' +
-            formatMoney(j.observed_100 || 0) +
+            formatMoney(
+                j.observed_100 || 0
+            ) +
             '</span>' +
         '</div>' +
 
         '<div class="obs-item">' +
             '<span class="obs-label">Error Residual</span>' +
             '<span class="obs-value">' +
-            formatMoney(j.observed_residual || 0) +
+            formatMoney(
+                j.observed_residual || 0
+            ) +
             '</span>' +
         '</div>' +
 
         '<div class="obs-item">' +
             '<span class="obs-label">Identificado</span>' +
             '<span class="obs-value">' +
-            formatMoney(j.effectively_identified || 0) +
+            formatMoney(
+                j.effectively_identified || 0
+            ) +
             '</span>' +
         '</div>';
 
-    document.getElementById("projected").innerHTML =
+
+    document.getElementById(
+        "projected"
+    ).innerHTML =
+
         '<div class="proj-item">' +
             '<span class="proj-label">Tasa error</span>' +
             '<span class="proj-value">' +
-            ((j.error_rate || 0) * 100).toFixed(2) +
+            (
+                (j.error_rate || 0) *
+                100
+            ).toFixed(2) +
             '%</span>' +
         '</div>' +
 
         '<div class="proj-item">' +
             '<span class="proj-label">Proyectado</span>' +
             '<span class="proj-value">' +
-            formatMoney(j.projected_residual || 0) +
+            formatMoney(
+                j.projected_residual || 0
+            ) +
             '</span>' +
         '</div>' +
 
         '<div class="proj-item">' +
             '<span class="proj-label">Total estimado</span>' +
             '<span class="proj-value">' +
-            formatMoney(j.total_estimated || 0) +
+            formatMoney(
+                j.total_estimated || 0
+            ) +
             '</span>' +
         '</div>';
 
-    document.getElementById("summary").innerHTML =
+
+    document.getElementById(
+        "summary"
+    ).innerHTML =
+
         '<div class="exec-kpi">' +
             '<div class="exec-kpi-label">Muestra</div>' +
             '<div class="exec-kpi-value">' +
@@ -654,36 +845,66 @@ async function updateExtrapolation() {
         '<div class="exec-kpi">' +
             '<div class="exec-kpi-label">Error proyectado</div>' +
             '<div class="exec-kpi-value">' +
-            formatMoney(j.projected_residual || 0) +
+            formatMoney(
+                j.projected_residual || 0
+            ) +
             '</div>' +
         '</div>' +
 
         '<div class="exec-kpi">' +
             '<div class="exec-kpi-label">Error total</div>' +
             '<div class="exec-kpi-value">' +
-            formatMoney(j.total_estimated || 0) +
+            formatMoney(
+                j.total_estimated || 0
+            ) +
             '</div>' +
         '</div>';
 
-    const mat = j.materiality || 0;
-    const checks = j.checks || {};
 
-    document.getElementById("conclusion").innerHTML =
+    const mat =
+        j.materiality || 0;
+
+    const checks =
+        j.checks || {};
+
+    document.getElementById(
+        "conclusion"
+    ).innerHTML =
+
         '<p>Error total: ' +
-        formatMoney(j.total_estimated || 0) +
+        formatMoney(
+            j.total_estimated || 0
+        ) +
+
         '. Materialidad: ' +
         formatMoney(mat) +
+
         '. Estado: ' +
-        (checks.total_vs_materiality || "sin umbral") +
+        (
+            checks.total_vs_materiality ||
+            "sin umbral"
+        ) +
+
         '.</p>';
 }
-function formatMoney(value) {
-    const number = Number(value) || 0;
 
-    return new Intl.NumberFormat("es-AR", {
-        style: "currency",
-        currency: "ARS",
-        minimumFractionDigits: 0,
-        maximumFractionDigits: 2
-    }).format(number);
+
+/* =========================================================
+   FORMATO MONETARIO
+   ========================================================= */
+
+function formatMoney(value) {
+
+    const number =
+        Number(value) || 0;
+
+    return new Intl.NumberFormat(
+        "es-AR",
+        {
+            style: "currency",
+            currency: "ARS",
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2
+        }
+    ).format(number);
 }
