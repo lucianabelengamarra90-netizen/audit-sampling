@@ -41,22 +41,37 @@
 
 <section id="poblacion" class="tab-content active">
 
-    <div class="card">
+    <div class="page-intro">
+        <span class="section-eyebrow">PASO 1</span>
+        <h2>Carga y análisis de población</h2>
+        <p>
+            Cargá la base, identificá las columnas relevantes y obtené una visión inicial del universo a auditar.
+        </p>
+    </div>
+
+    <div class="card hero-upload-card">
+
         <div class="section-heading">
             <div>
-                <span class="section-eyebrow">PASO 1</span>
                 <h2>Población</h2>
                 <p class="section-description">
-                    Cargá la base que será utilizada como universo para el muestreo.
+                    Importá la población completa en formato Excel o CSV para iniciar el proceso de muestreo.
                 </p>
             </div>
+
+            <span class="info-badge statistical">
+                BASE DE DATOS
+            </span>
         </div>
 
-        <div class="upload-area" id="drop">
+        <div class="upload-area upload-area-large" id="drop">
+
             <div class="upload-icon">📁</div>
+
             <p class="upload-text">
-                Arrastre Excel/CSV o haga clic para seleccionar
+                Arrastrá un archivo Excel/CSV o hacé clic para seleccionarlo
             </p>
+
             <p class="upload-hint">
                 Compatible con poblaciones superiores a 10.000 registros
             </p>
@@ -67,67 +82,164 @@
                 accept=".csv,.xlsx,.xls,.xlsb"
                 hidden
             >
+
         </div>
 
-        <div id="msg"></div>
+        <div id="msg" class="upload-message"></div>
+
     </div>
 
 
-    <div class="card" id="mappingCard" style="display:none">
+    <div
+        class="card mapping-card"
+        id="mappingCard"
+        style="display:none"
+    >
 
         <div class="section-heading">
+
             <div>
                 <h2>Mapeo de columnas</h2>
+
                 <p class="section-description">
-                    Indicá qué información representa cada columna de la base.
-                    ID e Importe son obligatorios.
+                    Indicá qué representa cada campo de la base. ID e Importe son obligatorios para continuar.
                 </p>
             </div>
+
+            <span class="info-badge monetary">
+                CONFIGURACIÓN
+            </span>
+
         </div>
 
-        <div class="mapping-grid" id="mapping"></div>
 
-        <button
-            class="btn btn-primary"
-            id="analyze"
-            style="margin-top:20px"
-        >
-            Analizar población
-        </button>
+        <div class="mapping-helper">
+
+            <div class="mapping-helper-item">
+                <strong>ID</strong>
+                <span>
+                    Identificador único del registro.
+                </span>
+            </div>
+
+            <div class="mapping-helper-item">
+                <strong>Importe</strong>
+                <span>
+                    Campo monetario utilizado para análisis y muestreo.
+                </span>
+            </div>
+
+            <div class="mapping-helper-item">
+                <strong>Otros campos</strong>
+                <span>
+                    Son opcionales y aportan contexto a la muestra.
+                </span>
+            </div>
+
+        </div>
+
+
+        <div
+            class="mapping-grid pretty-mapping-grid"
+            id="mapping"
+        ></div>
+
+
+        <div class="mapping-actions">
+
+            <button
+                class="btn btn-primary btn-large"
+                id="analyze"
+            >
+                Analizar población
+            </button>
+
+        </div>
 
     </div>
 
 
-    <div id="populationResults" style="display:none">
-
-        <div class="dashboard-grid" id="popKpis"></div>
+    <div
+        id="populationResults"
+        style="display:none"
+    >
 
         <div class="card">
+
             <div class="section-heading compact">
+
                 <div>
-                    <h3>Calidad y concentración</h3>
+                    <h2>Indicadores generales</h2>
+
                     <p class="section-description">
-                        Indicadores para detectar valores atípicos y concentración monetaria.
+                        Resumen cuantitativo de la población cargada.
                     </p>
                 </div>
+
+                <span class="info-badge statistical">
+                    ANÁLISIS
+                </span>
+
             </div>
 
-            <div class="quality-grid" id="quality"></div>
+            <div
+                class="dashboard-grid"
+                id="popKpis"
+            ></div>
+
         </div>
+
 
         <div class="card">
 
             <div class="section-heading compact">
+
                 <div>
-                    <h3>Vista previa</h3>
+                    <h2>Calidad y concentración</h2>
+
                     <p class="section-description">
-                        Se muestran solo algunas filas. La herramienta trabaja sobre la población completa.
+                        Indicadores para detectar valores atípicos, concentración monetaria y posibles riesgos en la población.
                     </p>
                 </div>
+
+            </div>
+
+            <div
+                class="quality-grid"
+                id="quality"
+            ></div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="section-heading compact">
+
+                <div>
+                    <h2>Vista previa</h2>
+
+                    <p class="section-description">
+                        Se muestran algunas filas a modo de referencia. La herramienta procesa la población completa.
+                    </p>
+                </div>
+
+            </div>
+
+            <div class="preview-note">
+                <span>Vista parcial</span>
+                <em>
+                    La cantidad de filas visibles no limita el análisis ni el cálculo de la muestra.
+                </em>
             </div>
 
             <div class="table-container">
-                <table class="data-table" id="preview"></table>
+
+                <table
+                    class="data-table"
+                    id="preview"
+                ></table>
+
             </div>
 
         </div>
