@@ -1898,3 +1898,159 @@ body {
         padding: 22px;
     }
 }
+/* =========================================================
+   MEJORAS NUEVAS - MUESTRA / RESULTADOS / EXTRAPOLACIÓN
+   Agregado sin modificar el diseño existente
+   ========================================================= */
+
+/* Código de selección y botón para repetir muestra */
+.code-pill {
+    min-width: 240px;
+}
+
+.repeat-area {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.repeat-area em {
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--muted);
+    font-style: italic;
+}
+
+
+/* Ayuda visual de los campos de Resultados */
+.results-guide {
+    margin-top: 22px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.results-guide > div {
+    background: #fafafa;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.results-guide strong {
+    font-size: 12px;
+}
+
+.results-guide em {
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--muted);
+    font-style: italic;
+}
+
+
+/* Botones Descargar / Importar Excel */
+.result-buttons {
+    margin-top: 20px;
+    margin-bottom: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+
+/* Resumen de resultados */
+.result-dashboard {
+    margin: 18px 0;
+}
+
+
+/* Campos que completa el auditor */
+.results-table .audit-col {
+    background: #fffdf0;
+}
+
+.results-table td.audit-col {
+    min-width: 165px;
+}
+
+.results-table td:nth-last-child(2),
+.results-table td:last-child {
+    min-width: 220px;
+}
+
+
+/* Extrapolación: bloques explicativos */
+.extrap-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    margin: 24px 0 18px;
+}
+
+.extrap-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px;
+    background: #fff;
+}
+
+.metric-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 13px 0;
+    border-bottom: 1px solid #ededed;
+}
+
+.metric-line span {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.metric-line strong {
+    text-align: right;
+}
+
+.metric-line.total {
+    border-bottom: 0;
+    padding-top: 18px;
+}
+
+.metric-line.total strong {
+    font-size: 18px;
+}
+
+
+/* Explicación de cómo se calcula la extrapolación */
+.explain-box {
+    background: #f8f8f8;
+    border-left: 4px solid #777;
+    border-radius: 6px;
+    padding: 14px;
+    font-size: 13px;
+    margin-bottom: 18px;
+}
+
+
+/* Responsive */
+@media (max-width: 900px) {
+    .extrap-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .results-guide {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 600px) {
+    .results-guide {
+        grid-template-columns: 1fr;
+    }
+}
