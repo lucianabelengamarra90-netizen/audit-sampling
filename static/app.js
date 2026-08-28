@@ -145,7 +145,6 @@ async function upload(e) {
                 " filas)";
 
 
-        // Nueva población = limpiar estados anteriores
         mapping = {};
         sample = [];
         results = {};
@@ -358,204 +357,107 @@ analyze.onclick = async () => {
     popKpis.innerHTML =
 
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Registros' +
-            '</div>' +
-
+            '<div class="kpi-label">Registros</div>' +
             '<div class="kpi-value">' +
                 j.records.toLocaleString() +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Importe Total' +
-            '</div>' +
-
+            '<div class="kpi-label">Importe Total</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.amount_total || 0
-                ) +
+                formatMoney(j.amount_total || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Promedio' +
-            '</div>' +
-
+            '<div class="kpi-label">Promedio</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.mean || 0
-                ) +
+                formatMoney(j.mean || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Mediana' +
-            '</div>' +
-
+            '<div class="kpi-label">Mediana</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.median || 0
-                ) +
+                formatMoney(j.median || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Máximo' +
-            '</div>' +
-
+            '<div class="kpi-label">Máximo</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.max || 0
-                ) +
+                formatMoney(j.max || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Mínimo' +
-            '</div>' +
-
+            '<div class="kpi-label">Mínimo</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.min || 0
-                ) +
+                formatMoney(j.min || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Desv. Estándar' +
-            '</div>' +
-
+            '<div class="kpi-label">Desv. Estándar</div>' +
             '<div class="kpi-value">' +
-                formatMoney(
-                    j.std || 0
-                ) +
+                formatMoney(j.std || 0) +
             '</div>' +
-
         '</div>' +
 
-
         '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Duplicados' +
-            '</div>' +
-
+            '<div class="kpi-label">Duplicados</div>' +
             '<div class="kpi-value">' +
                 (j.duplicate_rows || 0) +
             '</div>' +
-
         '</div>';
 
 
     quality.innerHTML =
 
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Ceros' +
-            '</span>' +
-
+            '<span class="quality-label">Ceros</span>' +
             '<span class="quality-value">' +
                 (j.zeros || 0) +
             '</span>' +
-
         '</div>' +
 
-
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Negativos' +
-            '</span>' +
-
+            '<span class="quality-label">Negativos</span>' +
             '<span class="quality-value">' +
                 (j.negatives || 0) +
             '</span>' +
-
         '</div>' +
 
-
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Outliers' +
-            '</span>' +
-
+            '<span class="quality-label">Outliers</span>' +
             '<span class="quality-value">' +
                 (j.outliers || 0) +
             '</span>' +
-
         '</div>' +
 
-
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Top 10' +
-            '</span>' +
-
+            '<span class="quality-label">Top 10</span>' +
             '<span class="quality-value">' +
-                (j.top10_pct || 0)
-                    .toFixed(1) +
+                (j.top10_pct || 0).toFixed(1) +
                 '%' +
             '</span>' +
-
         '</div>' +
 
-
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Top 20' +
-            '</span>' +
-
+            '<span class="quality-label">Top 20</span>' +
             '<span class="quality-value">' +
-                (j.top20_pct || 0)
-                    .toFixed(1) +
+                (j.top20_pct || 0).toFixed(1) +
                 '%' +
             '</span>' +
-
         '</div>' +
 
-
         '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                'Top 50' +
-            '</span>' +
-
+            '<span class="quality-label">Top 50</span>' +
             '<span class="quality-value">' +
-                (j.top50_pct || 0)
-                    .toFixed(1) +
+                (j.top50_pct || 0).toFixed(1) +
                 '%' +
             '</span>' +
-
         '</div>';
 
 
@@ -643,11 +545,8 @@ document
             const zmap = {
 
                 "90": 1.645,
-
                 "95": 1.96,
-
                 "97": 2.17,
-
                 "99": 2.576
             };
 
@@ -1019,11 +918,6 @@ async function generateSample(
 
         p,
 
-
-        // Muestra nueva:
-        // genera un código nuevo.
-        // Repetición:
-        // utiliza exactamente el mismo.
 
         seed:
             selectionCode !== null
@@ -1522,9 +1416,6 @@ function renderResultsTable() {
                             results[orig];
 
 
-                        // El importe registrado se completa
-                        // automáticamente con el valor de la población.
-
                         const defaultRegistered =
                             getRegisteredAmount(row);
 
@@ -1586,8 +1477,6 @@ function renderResultsTable() {
                                 .join("") +
 
 
-                            // RESULTADO DE REVISIÓN
-
                             '<td class="audit-col">' +
 
                                 '<select ' +
@@ -1630,8 +1519,6 @@ function renderResultsTable() {
                             '</td>' +
 
 
-                            // IMPORTE REGISTRADO
-
                             '<td class="audit-col">' +
 
                                 '<input ' +
@@ -1649,8 +1536,6 @@ function renderResultsTable() {
 
                             '</td>' +
 
-
-                            // IMPORTE VALIDADO
 
                             '<td class="audit-col">' +
 
@@ -1670,8 +1555,6 @@ function renderResultsTable() {
                             '</td>' +
 
 
-                            // DIFERENCIA
-
                             '<td ' +
                                 'class="audit-col res-diff" ' +
                                 'data-idx="' +
@@ -1684,8 +1567,6 @@ function renderResultsTable() {
 
                             '</td>' +
 
-
-                            // TIPO DE EXCEPCIÓN
 
                             '<td class="audit-col">' +
 
@@ -1750,8 +1631,6 @@ function renderResultsTable() {
                             '</td>' +
 
 
-                            // COMENTARIO
-
                             '<td class="audit-col">' +
 
                                 '<input ' +
@@ -1769,8 +1648,6 @@ function renderResultsTable() {
 
                             '</td>' +
 
-
-                            // EVIDENCIA
 
                             '<td class="audit-col">' +
 
@@ -1939,10 +1816,6 @@ function handleStatusChange(e) {
     results[idx].status =
         sel.value;
 
-
-    // Si el auditor marca "Sin excepción",
-    // la herramienta iguala el importe validado
-    // al registrado automáticamente.
 
     if (
         sel.value ===
@@ -2291,9 +2164,6 @@ document
             }
 
 
-            // Antes de guardar, levantamos TODOS
-            // los campos visibles de la tabla.
-
             collectVisibleResults();
 
 
@@ -2331,8 +2201,6 @@ document
                                 res.validated !== undefined
                                     ? res.validated
                                     : "",
-
-                            // Compatibilidad con backend anterior
 
                             audited:
                                 res.registered !== undefined
@@ -2842,7 +2710,7 @@ async function updateExtrapolation() {
             '<div class="obs-item">' +
 
                 '<span class="obs-label">' +
-                    'Error 100%' +
+                    'Error detectado en revisión 100%' +
                 '</span>' +
 
                 '<span class="obs-value">' +
@@ -2860,7 +2728,7 @@ async function updateExtrapolation() {
             '<div class="obs-item">' +
 
                 '<span class="obs-label">' +
-                    'Error muestra probabilística' +
+                    'Error detectado en muestra probabilística' +
                 '</span>' +
 
                 '<span class="obs-value">' +
@@ -2878,7 +2746,7 @@ async function updateExtrapolation() {
             '<div class="obs-item">' +
 
                 '<span class="obs-label">' +
-                    'Error identificado' +
+                    'Total de errores efectivamente detectados' +
                 '</span>' +
 
                 '<span class="obs-value">' +
@@ -2903,7 +2771,7 @@ async function updateExtrapolation() {
             '<div class="proj-item">' +
 
                 '<span class="proj-label">' +
-                    'Tasa de error' +
+                    'Tasa de error observada' +
                 '</span>' +
 
                 '<span class="proj-value">' +
@@ -2927,7 +2795,7 @@ async function updateExtrapolation() {
             '<div class="proj-item">' +
 
                 '<span class="proj-label">' +
-                    'Error proyectado' +
+                    'Error estimado en el universo probabilístico' +
                 '</span>' +
 
                 '<span class="proj-value">' +
@@ -2945,7 +2813,7 @@ async function updateExtrapolation() {
             '<div class="proj-item">' +
 
                 '<span class="proj-label">' +
-                    'Total estimado' +
+                    'Error total estimado de la población' +
                 '</span>' +
 
                 '<span class="proj-value">' +
