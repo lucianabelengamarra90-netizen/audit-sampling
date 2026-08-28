@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+uploads/*
+exports/*
+!uploads/.gitkeep
+!exports/.gitkeep
+*.csv
+*.xlsx
+.DS_Store
+*.log
