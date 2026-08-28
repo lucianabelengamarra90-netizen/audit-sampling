@@ -1,8 +1,261 @@
-<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Audit Sampling & Extrapolation</title><link rel="stylesheet" href="/static/styles.css"></head><body><header class="header"><div class="header-content"><div><h1 class="app-title">Audit Sampling & Extrapolation</h1><p class="app-subtitle">Herramienta de Muestreo de Auditor�a</p></div><span class="project-status" id="fileStatus">Sin poblaci�n cargada</span></div></header><nav class="main-nav"><div class="nav-container"><button class="nav-tab active" data-tab="poblacion">Poblaci�n</button><button class="nav-tab" data-tab="diseno">Dise�o</button><button class="nav-tab" data-tab="muestra">Muestra</button><button class="nav-tab" data-tab="resultados">Resultados</button><button class="nav-tab" data-tab="extrapolacion">Extrapolaci�n</button><button class="nav-tab" data-tab="resumen">Resumen</button></div></nav><main class="main-content">
-<section id="poblacion" class="tab-content active"><div class="card"><h2>Poblaci�n</h2><div class="upload-area" id="drop"><div class="upload-icon">&#128193;</div><p class="upload-text">Arrastre Excel/CSV o haga clic para seleccionar</p><p class="upload-hint">Soporta +10,000 registros</p><input id="file" type="file" accept=".csv,.xlsx,.xls,.xlsb" hidden></div><div id="msg"></div></div><div class="card" id="mappingCard" style="display:none"><h2>Mapeo de columnas</h2><div class="mapping-grid" id="mapping"></div><button class="btn btn-primary" id="analyze" style="margin-top:20px">Analizar poblaci�n</button></div><div id="populationResults" style="display:none"><div class="dashboard-grid" id="popKpis"></div><div class="card"><h3>Calidad y concentraci�n</h3><div class="quality-grid" id="quality"></div></div><div class="card"><h3>Vista previa</h3><div class="table-container"><table class="data-table" id="preview"></table></div></div></div></section>
-<section id="diseno" class="tab-content"><div class="card"><h2>A. Tama�o de muestra</h2><div class="form-grid"><div class="form-group"><label>Poblaci�n N</label><input id="N" class="form-input" readonly></div><div class="form-group"><label>Confianza</label><select id="confidence" class="form-input"><option value="90">90% (Z=1.645)</option><option value="95" selected>95% (Z=1.96)</option><option value="97">97% (Z=2.17)</option><option value="99">99% (Z=2.576)</option></select></div><div class="form-group"><label>Margen error e</label><input id="error" type="number" value="0.05" min="0.01" max="0.5" step="0.01" class="form-input"></div><div class="form-group"><label>p</label><input id="p" type="number" value="0.5" min="0" max="1" step="0.05" class="form-input"></div><div class="form-group"><label>q</label><input id="q" class="form-input" readonly></div></div><p class="sample-result">Recomendado: <strong id="nResult">-</strong> <button id="howSample" class="btn btn-secondary" style="margin-left:10px">�C�mo se calcul�?</button></p></div><div class="card"><h2>B. Materialidad</h2><div class="form-grid"><div class="form-group"><label>Materialidad global</label><input id="materiality" type="number" class="form-input"></div><div class="form-group"><label>Error tolerable</label><input id="tolerable" type="number" class="form-input"></div><div class="form-group"><label>Umbral significativas</label><input id="threshold" type="number" class="form-input"></div></div></div><div class="card"><h2>C. M�todo</h2><div class="method-grid"><label class="method-option"><input type="radio" name="method" value="random" checked>Aleatorio</label><label class="method-option"><input type="radio" name="method" value="systematic">Sistem�tico</label><label class="method-option"><input type="radio" name="method" value="stratified">Estratificado</label><label class="method-option"><input type="radio" name="method" value="mus">MUS/PPS</label><label class="method-option"><input type="radio" name="method" value="topn">Top N</label></div><p class="checkbox-group"><label class="checkbox-label"><input id="incMat" type="checkbox" checked>100% significativas</label><label class="checkbox-label"><input id="incOut" type="checkbox" checked>100% outliers</label></p><button id="recommend" class="btn btn-secondary">Recomendar</button> <button id="generate" class="btn btn-primary">Generar muestra</button><div id="recommendationBox" class="recommendation-box" style="display:none"></div></div></section>
-<section id="muestra" class="tab-content"><div class="card"><h2>Muestra seleccionada</h2><div class="sample-summary" id="sampleSummary"></div><div class="table-container"><table id="sampleTable" class="data-table"></table></div></div></section>
-<section id="resultados" class="tab-content"><div class="card"><h2>Resultados</h2><div class="results-dashboard" id="resultsDash"></div><div class="table-container"><table id="resultsTable" class="data-table"></table></div><button id="saveResults" class="btn btn-primary" style="margin-top:20px">Guardar resultados</button></div></section>
-<section id="extrapolacion" class="tab-content"><div class="card"><h2>Extrapolaci�n</h2><div id="extraWarning"></div><div class="extrapolation-grid"><div class="extrapolation-section"><h3>Observado</h3><div id="observed"></div></div><div class="extrapolation-section"><h3>Proyectado</h3><div id="projected"></div></div></div><button id="refreshExtra" class="btn btn-primary" style="margin-top:20px">Actualizar</button></div></section>
-<section id="resumen" class="tab-content"><div class="card"><h2>Resumen ejecutivo</h2><div class="executive-dashboard" id="summary"></div><div class="card"><h3>Conclusi�n</h3><p id="conclusion">Genere y eval�e la muestra para obtener resumen.</p></div><a class="btn btn-primary" href="/api/export" style="margin-top:20px;display:inline-block;text-decoration:none">Exportar Excel</a></div></section>
-</main><div id="modal" class="modal"><div class="modal-content"><div class="modal-header"><h3>C�mo se calcul�</h3><button class="modal-close">&times;</button></div><div id="modalText" class="modal-body"></div></div></div><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Audit Sampling & Extrapolation</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="header">
+  <div class="header-content">
+    <div>
+      <h1 class="app-title">Audit Sampling & Extrapolation</h1>
+      <p class="app-subtitle">Herramienta de Muestreo de Auditoría</p>
+    </div>
+    <span class="project-status" id="fileStatus">Sin población cargada</span>
+  </div>
+</header>
+
+<nav class="main-nav">
+  <div class="nav-container">
+    <button class="nav-tab active" data-tab="poblacion">Población</button>
+    <button class="nav-tab" data-tab="diseno">Diseño</button>
+    <button class="nav-tab" data-tab="muestra">Muestra</button>
+    <button class="nav-tab" data-tab="resultados">Resultados</button>
+    <button class="nav-tab" data-tab="extrapolacion">Extrapolación</button>
+    <button class="nav-tab" data-tab="resumen">Resumen</button>
+  </div>
+</nav>
+
+<main class="main-content">
+
+<section id="poblacion" class="tab-content active">
+  <div class="card">
+    <h2>Población</h2>
+    <div class="upload-area" id="drop">
+      <div class="upload-icon">&#128193;</div>
+      <p class="upload-text">Arrastre Excel/CSV o haga clic para seleccionar</p>
+      <p class="upload-hint">Soporta +10,000 registros</p>
+      <input id="file" type="file" accept=".csv,.xlsx,.xls,.xlsb" hidden>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card" id="mappingCard" style="display:none">
+    <h2>Mapeo de columnas</h2>
+    <div class="mapping-grid" id="mapping"></div>
+    <button class="btn btn-primary" id="analyze" style="margin-top:20px">Analizar población</button>
+  </div>
+
+  <div id="populationResults" style="display:none">
+    <div class="dashboard-grid" id="popKpis"></div>
+
+    <div class="card">
+      <h3>Calidad y concentración</h3>
+      <div class="quality-grid" id="quality"></div>
+    </div>
+
+    <div class="card">
+      <h3>Vista previa</h3>
+      <div class="table-container">
+        <table class="data-table" id="preview"></table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="diseno" class="tab-content">
+
+  <div class="card">
+    <h2>A. Tamaño de muestra</h2>
+
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Población N</label>
+        <input id="N" class="form-input" readonly>
+      </div>
+
+      <div class="form-group">
+        <label>Confianza</label>
+        <select id="confidence" class="form-input">
+          <option value="90">90% (Z=1.645)</option>
+          <option value="95" selected>95% (Z=1.96)</option>
+          <option value="97">97% (Z=2.17)</option>
+          <option value="99">99% (Z=2.576)</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Margen de error e</label>
+        <input id="error" type="number" value="0.05" min="0.01" max="0.5" step="0.01" class="form-input">
+      </div>
+
+      <div class="form-group">
+        <label>p</label>
+        <input id="p" type="number" value="0.5" min="0" max="1" step="0.05" class="form-input">
+      </div>
+
+      <div class="form-group">
+        <label>q</label>
+        <input id="q" class="form-input" readonly>
+      </div>
+    </div>
+
+    <p class="sample-result">
+      Recomendado: <strong id="nResult">-</strong>
+      <button id="howSample" class="btn btn-secondary" style="margin-left:10px">
+        ¿Cómo se calculó?
+      </button>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>B. Materialidad</h2>
+
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Materialidad global</label>
+        <input id="materiality" type="number" class="form-input">
+      </div>
+
+      <div class="form-group">
+        <label>Error tolerable</label>
+        <input id="tolerable" type="number" class="form-input">
+      </div>
+
+      <div class="form-group">
+        <label>Umbral de partidas significativas</label>
+        <input id="threshold" type="number" class="form-input">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>C. Método</h2>
+
+    <div class="method-grid">
+      <label class="method-option">
+        <input type="radio" name="method" value="random" checked>Aleatorio
+      </label>
+
+      <label class="method-option">
+        <input type="radio" name="method" value="systematic">Sistemático
+      </label>
+
+      <label class="method-option">
+        <input type="radio" name="method" value="stratified">Estratificado
+      </label>
+
+      <label class="method-option">
+        <input type="radio" name="method" value="mus">MUS/PPS
+      </label>
+
+      <label class="method-option">
+        <input type="radio" name="method" value="topn">Top N
+      </label>
+    </div>
+
+    <p class="checkbox-group">
+      <label class="checkbox-label">
+        <input id="incMat" type="checkbox" checked>100% significativas
+      </label>
+
+      <label class="checkbox-label">
+        <input id="incOut" type="checkbox" checked>100% outliers
+      </label>
+    </p>
+
+    <button id="recommend" class="btn btn-secondary">Recomendar</button>
+    <button id="generate" class="btn btn-primary">Generar muestra</button>
+
+    <div id="recommendationBox" class="recommendation-box" style="display:none"></div>
+  </div>
+
+</section>
+
+<section id="muestra" class="tab-content">
+  <div class="card">
+    <h2>Muestra seleccionada</h2>
+    <div class="sample-summary" id="sampleSummary"></div>
+    <div class="table-container">
+      <table id="sampleTable" class="data-table"></table>
+    </div>
+  </div>
+</section>
+
+<section id="resultados" class="tab-content">
+  <div class="card">
+    <h2>Resultados</h2>
+
+    <div class="results-dashboard" id="resultsDash"></div>
+
+    <div class="table-container">
+      <table id="resultsTable" class="data-table"></table>
+    </div>
+
+    <button id="saveResults" class="btn btn-primary" style="margin-top:20px">
+      Guardar resultados
+    </button>
+  </div>
+</section>
+
+<section id="extrapolacion" class="tab-content">
+  <div class="card">
+    <h2>Extrapolación</h2>
+
+    <div id="extraWarning"></div>
+
+    <div class="extrapolation-grid">
+      <div class="extrapolation-section">
+        <h3>Observado</h3>
+        <div id="observed"></div>
+      </div>
+
+      <div class="extrapolation-section">
+        <h3>Proyectado</h3>
+        <div id="projected"></div>
+      </div>
+    </div>
+
+    <button id="refreshExtra" class="btn btn-primary" style="margin-top:20px">
+      Actualizar
+    </button>
+  </div>
+</section>
+
+<section id="resumen" class="tab-content">
+  <div class="card">
+    <h2>Resumen ejecutivo</h2>
+
+    <div class="executive-dashboard" id="summary"></div>
+
+    <div class="card">
+      <h3>Conclusión</h3>
+      <p id="conclusion">Genere y evalúe la muestra para obtener el resumen.</p>
+    </div>
+
+    <a class="btn btn-primary" href="/api/export"
+       style="margin-top:20px;display:inline-block;text-decoration:none">
+       Exportar Excel
+    </a>
+  </div>
+</section>
+
+</main>
+
+<div id="modal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Cómo se calculó</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <div id="modalText" class="modal-body"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>
