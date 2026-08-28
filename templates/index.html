@@ -111,8 +111,460 @@
 </nav>
 
 
-
 <main class="main-content">
+
+
+<!-- ===================================================== -->
+<!-- TRACKING DEL TRABAJO -->
+<!-- ===================================================== -->
+
+<section
+    id="workTracker"
+    style="margin-bottom:24px;"
+>
+
+    <div class="card">
+
+        <div class="section-heading">
+
+            <div>
+
+                <span class="section-eyebrow">
+                    TRAZABILIDAD
+                </span>
+
+                <h2>
+                    Trabajo de auditoría
+                </h2>
+
+                <p class="section-description">
+                    Guardá el trabajo para poder retomarlo desde otra sesión
+                    o desde otra computadora.
+                </p>
+
+            </div>
+
+
+            <span
+                id="dbStatus"
+                class="info-badge statistical"
+            >
+                VERIFICANDO BASE
+            </span>
+
+        </div>
+
+
+        <!-- ================================================= -->
+        <!-- SIN TRABAJO ABIERTO -->
+        <!-- ================================================= -->
+
+        <div id="workNoActive">
+
+
+            <div
+                style="
+                    display:grid;
+                    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+                    gap:18px;
+                "
+            >
+
+
+                <!-- NUEVO TRABAJO -->
+
+                <div
+                    style="
+                        border:1px solid var(--border);
+                        border-radius:12px;
+                        padding:20px;
+                        background:#fafafa;
+                    "
+                >
+
+                    <h3 style="margin-top:0;">
+                        Nuevo trabajo
+                    </h3>
+
+                    <p class="section-description">
+                        Creá un expediente para guardar población,
+                        muestra, resultados y trazabilidad.
+                    </p>
+
+
+                    <div class="form-group">
+
+                        <label>
+                            Nombre del trabajo
+                        </label>
+
+                        <input
+                            id="newWorkName"
+                            class="form-input"
+                            type="text"
+                            placeholder="Ej. Gift Cards Ene-Jun 2026"
+                        >
+
+                        <small class="field-help">
+                            Nombre que permita identificar fácilmente la auditoría.
+                        </small>
+
+                    </div>
+
+
+                    <div
+                        class="form-group"
+                        style="margin-top:14px;"
+                    >
+
+                        <label>
+                            Responsable
+                        </label>
+
+                        <input
+                            id="newWorkResponsible"
+                            class="form-input"
+                            type="text"
+                            placeholder="Nombre del auditor responsable"
+                        >
+
+                        <small class="field-help">
+                            Persona responsable del trabajo o seguimiento.
+                        </small>
+
+                    </div>
+
+
+                    <button
+                        id="createWork"
+                        class="btn btn-primary"
+                        type="button"
+                        style="margin-top:18px;"
+                    >
+                        Crear y guardar trabajo
+                    </button>
+
+                </div>
+
+
+
+                <!-- ABRIR TRABAJO -->
+
+                <div
+                    style="
+                        border:1px solid var(--border);
+                        border-radius:12px;
+                        padding:20px;
+                        background:#fafafa;
+                    "
+                >
+
+                    <h3 style="margin-top:0;">
+                        Abrir trabajo existente
+                    </h3>
+
+                    <p class="section-description">
+                        Recuperá un trabajo guardado anteriormente.
+                    </p>
+
+
+                    <div class="form-group">
+
+                        <label>
+                            Código de trabajo
+                        </label>
+
+                        <input
+                            id="openWorkCode"
+                            class="form-input"
+                            type="text"
+                            placeholder="AUD-2026-000001"
+                            autocomplete="off"
+                        >
+
+                        <small class="field-help">
+                            Código generado al crear el trabajo.
+                        </small>
+
+                    </div>
+
+
+                    <div
+                        class="form-group"
+                        style="margin-top:14px;"
+                    >
+
+                        <label>
+                            Clave de acceso
+                        </label>
+
+                        <input
+                            id="openWorkKey"
+                            class="form-input"
+                            type="password"
+                            placeholder="Ingrese la clave"
+                            autocomplete="off"
+                        >
+
+                        <small class="field-help">
+                            Clave asociada al Código de trabajo.
+                        </small>
+
+                    </div>
+
+
+                    <button
+                        id="openWork"
+                        class="btn btn-secondary"
+                        type="button"
+                        style="margin-top:18px;"
+                    >
+                        Abrir trabajo
+                    </button>
+
+                </div>
+
+
+            </div>
+
+
+            <!-- CÓDIGO Y CLAVE AL CREAR -->
+
+            <div
+                id="createdWorkCredentials"
+                style="
+                    display:none;
+                    margin-top:18px;
+                    padding:18px;
+                    background:#fff8d9;
+                    border:1px solid #ead992;
+                    border-radius:10px;
+                "
+            >
+
+                <strong>
+                    Guardá estos datos
+                </strong>
+
+                <p style="margin:6px 0 14px;">
+                    Los vas a necesitar para abrir este trabajo desde otra PC.
+                </p>
+
+
+                <div
+                    style="
+                        display:flex;
+                        gap:25px;
+                        flex-wrap:wrap;
+                    "
+                >
+
+                    <div>
+
+                        <small>
+                            Código de trabajo
+                        </small>
+
+                        <div
+                            id="createdWorkCode"
+                            style="
+                                font-size:18px;
+                                font-weight:700;
+                                margin-top:4px;
+                            "
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div>
+
+                        <small>
+                            Clave de acceso
+                        </small>
+
+                        <div
+                            id="createdWorkKey"
+                            style="
+                                font-size:18px;
+                                font-weight:700;
+                                margin-top:4px;
+                            "
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <small
+                    class="field-help"
+                    style="
+                        display:block;
+                        margin-top:14px;
+                    "
+                >
+                    La clave se muestra al crear el trabajo.
+                    Guardala junto con el Código de trabajo.
+                </small>
+
+            </div>
+
+
+        </div>
+
+
+
+        <!-- ================================================= -->
+        <!-- TRABAJO ACTUAL -->
+        <!-- ================================================= -->
+
+        <div
+            id="workActive"
+            style="display:none;"
+        >
+
+
+            <div
+                style="
+                    display:grid;
+                    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+                    gap:12px;
+                    margin-top:8px;
+                "
+            >
+
+
+                <div class="kpi-card">
+
+                    <div class="kpi-label">
+                        Código de trabajo
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="currentWorkCode"
+                        style="font-size:18px;"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="kpi-card">
+
+                    <div class="kpi-label">
+                        Nombre
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="currentWorkName"
+                        style="font-size:18px;"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="kpi-card">
+
+                    <div class="kpi-label">
+                        Responsable
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="currentWorkResponsible"
+                        style="font-size:18px;"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="kpi-card">
+
+                    <div class="kpi-label">
+                        Estado
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="currentWorkStatus"
+                        style="font-size:18px;"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+            </div>
+
+
+
+            <div
+                style="
+                    display:flex;
+                    gap:10px;
+                    flex-wrap:wrap;
+                    margin-top:18px;
+                "
+            >
+
+                <button
+                    id="saveWork"
+                    class="btn btn-primary"
+                    type="button"
+                >
+                    Guardar trabajo
+                </button>
+
+
+                <button
+                    id="closeWork"
+                    class="btn btn-secondary"
+                    type="button"
+                >
+                    Cerrar trabajo
+                </button>
+
+            </div>
+
+
+            <small
+                class="field-help"
+                style="
+                    display:block;
+                    margin-top:12px;
+                "
+            >
+                El trabajo se guarda automáticamente en los principales
+                pasos del proceso. Guardar trabajo permite forzar un
+                guardado manual antes de cerrar la sesión.
+            </small>
+
+        </div>
+
+
+        <div
+            id="workMessage"
+            style="margin-top:14px;"
+        ></div>
+
+
+    </div>
+
+</section>
+
 
 
 <!-- ===================================================== -->
@@ -160,13 +612,11 @@
 
             </div>
 
-
             <span class="info-badge statistical">
                 BASE DE DATOS
             </span>
 
         </div>
-
 
 
         <div
@@ -309,8 +759,6 @@
     </div>
 
 
-
-    <!-- RESULTADOS POBLACIÓN -->
 
     <div
         id="populationResults"
@@ -462,9 +910,7 @@
 
 
 
-    <!-- ================================================= -->
     <!-- A. TAMAÑO -->
-    <!-- ================================================= -->
 
     <div class="card">
 
@@ -680,9 +1126,7 @@
 
 
 
-    <!-- ================================================= -->
     <!-- B. MATERIALIDAD -->
-    <!-- ================================================= -->
 
     <div class="card">
 
@@ -784,9 +1228,7 @@
 
 
 
-    <!-- ================================================= -->
     <!-- C. MÉTODO -->
-    <!-- ================================================= -->
 
     <div class="card">
 
@@ -811,8 +1253,6 @@
 
         <div class="method-grid method-cards">
 
-
-            <!-- ALEATORIO -->
 
             <label class="method-option">
 
@@ -852,8 +1292,6 @@
 
 
 
-            <!-- SISTEMÁTICO -->
-
             <label class="method-option">
 
                 <input
@@ -890,8 +1328,6 @@
             </label>
 
 
-
-            <!-- ESTRATIFICADO -->
 
             <label class="method-option">
 
@@ -930,8 +1366,6 @@
 
 
 
-            <!-- MUS -->
-
             <label class="method-option">
 
                 <input
@@ -968,8 +1402,6 @@
             </label>
 
 
-
-            <!-- TOP N -->
 
             <label class="method-option">
 
@@ -1010,10 +1442,6 @@
         </div>
 
 
-
-        <!-- ================================================= -->
-        <!-- INCLUSIONES 100% -->
-        <!-- ================================================= -->
 
         <div class="selection-rules">
 
@@ -1070,10 +1498,6 @@
         </div>
 
 
-
-        <!-- ================================================= -->
-        <!-- ACCIONES -->
-        <!-- ================================================= -->
 
         <div class="method-actions">
 
@@ -1152,8 +1576,6 @@
         ></div>
 
 
-
-        <!-- REPETIR SELECCIÓN -->
 
         <div
             id="repeatArea"
@@ -1238,10 +1660,6 @@
         </div>
 
 
-
-        <!-- ================================================= -->
-        <!-- GUÍA DE CAMPOS -->
-        <!-- ================================================= -->
 
         <div class="results-guide">
 
@@ -1353,20 +1771,12 @@
 
 
 
-        <!-- ================================================= -->
-        <!-- INDICADORES -->
-        <!-- ================================================= -->
-
         <div
             class="results-dashboard result-dashboard"
             id="resultsDash"
         ></div>
 
 
-
-        <!-- ================================================= -->
-        <!-- EXCEL -->
-        <!-- ================================================= -->
 
         <div class="result-buttons">
 
@@ -1403,10 +1813,6 @@
 
 
 
-        <!-- ================================================= -->
-        <!-- TABLA -->
-        <!-- ================================================= -->
-
         <div class="table-container">
 
             <table
@@ -1417,10 +1823,6 @@
         </div>
 
 
-
-        <!-- ================================================= -->
-        <!-- GUARDAR -->
-        <!-- ================================================= -->
 
         <button
             id="saveResults"
@@ -1480,8 +1882,6 @@
         <div class="extrapolation-grid">
 
 
-            <!-- OBSERVADO -->
-
             <div class="extrapolation-section">
 
                 <span class="result-type observed">
@@ -1497,8 +1897,6 @@
             </div>
 
 
-
-            <!-- PROYECTADO -->
 
             <div class="extrapolation-section">
 
@@ -1653,10 +2051,6 @@
 </div>
 
 
-
-<!-- ===================================================== -->
-<!-- JAVASCRIPT -->
-<!-- ===================================================== -->
 
 <script src="/static/app.js"></script>
 
