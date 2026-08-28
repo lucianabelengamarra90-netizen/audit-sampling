@@ -2,32 +2,36 @@
 // AUDIT SAMPLING & EXTRAPOLATION - FRONTEND
 // =========================================================
 
-let population = null,
-    mapping = {},
-    sample = [],
-    results = {},
-    lastSelectionCode = null;
+let population = null;
+let mapping = {};
+let sample = [];
+let results = {};
+let lastSelectionCode = null;
+let currentWork = null;
 
 
 // =========================================================
 // NAVEGACIÓN
 // =========================================================
 
-document.querySelectorAll(".nav-tab").forEach(t => t.onclick = () => {
+document.querySelectorAll(".nav-tab").forEach(tab => {
 
-    document
-        .querySelectorAll(".nav-tab")
-        .forEach(x => x.classList.remove("active"));
+    tab.onclick = () => {
 
-    document
-        .querySelectorAll(".tab-content")
-        .forEach(x => x.classList.remove("active"));
+        document
+            .querySelectorAll(".nav-tab")
+            .forEach(x => x.classList.remove("active"));
 
-    t.classList.add("active");
+        document
+            .querySelectorAll(".tab-content")
+            .forEach(x => x.classList.remove("active"));
 
-    document
-        .getElementById(t.dataset.tab)
-        .classList.add("active");
+        tab.classList.add("active");
+
+        document
+            .getElementById(tab.dataset.tab)
+            .classList.add("active");
+    };
 });
 
 
@@ -35,24 +39,1434 @@ document.querySelectorAll(".nav-tab").forEach(t => t.onclick = () => {
 // ELEMENTOS PRINCIPALES
 // =========================================================
 
-const drop = document.getElementById("drop"),
-      file = document.getElementById("file"),
-      msg = document.getElementById("msg"),
-      mappingCard = document.getElementById("mappingCard"),
-      mappingDiv = document.getElementById("mapping"),
-      analyze = document.getElementById("analyze"),
-      preview = document.getElementById("preview"),
-      popKpis = document.getElementById("popKpis"),
-      quality = document.getElementById("quality");
+const drop = document.getElementById("drop");
+const file = document.getElementById("file");
+const msg = document.getElementById("msg");
+const mappingCard = document.getElementById("mappingCard");
+const mappingDiv = document.getElementById("mapping");
+const analyze = document.getElementById("analyze");
+const preview = document.getElementById("preview");
+const popKpis = document.getElementById("popKpis");
+const quality = document.getElementById("quality");
+
+
+// =========================================================
+// TRACKING DE TRABAJOS
+// =========================================================
+
+async function initializeWorkTracking() {
+
+    await checkDatabaseStatus();
+
+    try {
+
+        const r = await fetch("/api/work/current");
+        const state = await r.json();
+
+        if (!r.ok || state.error) {
+            showWorkMessage(
+                state.error || "No se pudo recuperar el trabajo actual.",
+                "error"
+            );
+            return;
+        }
+
+        renderWorkState(state);
+
+        if (
+            state.population ||
+            (state.sample && state.sample.rows)
+        ) {
+            await restoreProjectState(state);
+        }
+
+    } catch (err) {
+
+        showWorkMessage(
+            "No se pudo consultar el estado del trabajo: " + err.message,
+            "error"
+        );
+    }
+}
+
+
+async function checkDatabaseStatus() {
+
+    const badge = document.getElementById("dbStatus");
+
+    if (!badge) return;
+
+    try {
+
+        const r = await fetch("/api/work/db-status");
+        const j = await r.json();
+
+        if (j.available) {
+
+            badge.textContent = "BASE DISPONIBLE";
+
+            badge.style.background = "#e9f7ef";
+            badge.style.color = "#207544";
+
+        } else {
+
+            badge.textContent = "BASE NO DISPONIBLE";
+
+            badge.style.background = "#fdecec";
+            badge.style.color = "#a73030";
+
+            if (j.message) {
+                showWorkMessage(j.message, "error");
+            }
+        }
+
+    } catch (err) {
+
+        badge.textContent = "BASE NO DISPONIBLE";
+
+        badge.style.background = "#fdecec";
+        badge.style.color = "#a73030";
+    }
+}
+
+
+function renderWorkState(state) {
+
+    const work =
+        state && state.work
+            ? state.work
+            : {};
+
+    currentWork = work;
+
+    const noActive =
+        document.getElementById("workNoActive");
+
+    const active =
+        document.getElementById("workActive");
+
+
+    if (work.work_code) {
+
+        if (noActive) {
+            noActive.style.display = "none";
+        }
+
+        if (active) {
+            active.style.display = "block";
+        }
+
+        document.getElementById("currentWorkCode").textContent =
+            work.work_code || "-";
+
+        document.getElementById("currentWorkName").textContent =
+            work.name || "-";
+
+        document.getElementById("currentWorkResponsible").textContent =
+            work.responsible || "-";
+
+        document.getElementById("currentWorkStatus").textContent =
+            work.status || "En curso";
+
+    } else {
+
+        if (noActive) {
+            noActive.style.display = "block";
+        }
+
+        if (active) {
+            active.style.display = "none";
+        }
+    }
+}
+
+
+function showWorkMessage(text, type = "info") {
+
+    const box =
+        document.getElementById("workMessage");
+
+    if (!box) return;
+
+    if (!text) {
+        box.innerHTML = "";
+        return;
+    }
+
+    let bg = "#f7f7f7";
+    let border = "#dddddd";
+
+    if (type === "success") {
+        bg = "#edf8f0";
+        border = "#b8dfc3";
+    }
+
+    if (type === "warning") {
+        bg = "#fff8d9";
+        border = "#ead992";
+    }
+
+    if (type === "error") {
+        bg = "#fdecec";
+        border = "#edbaba";
+    }
+
+    box.innerHTML =
+        '<div style="' +
+            'padding:14px 16px;' +
+            'border-radius:9px;' +
+            'background:' + bg + ';' +
+            'border:1px solid ' + border + ';' +
+            'font-size:13px;' +
+            'line-height:1.45;' +
+        '">' +
+            text +
+        '</div>';
+}
+
+
+// =========================================================
+// CREAR TRABAJO
+// =========================================================
+
+const createWorkButton =
+    document.getElementById("createWork");
+
+
+if (createWorkButton) {
+
+    createWorkButton.onclick = async () => {
+
+        const name =
+            document
+                .getElementById("newWorkName")
+                .value
+                .trim();
+
+        const responsible =
+            document
+                .getElementById("newWorkResponsible")
+                .value
+                .trim();
+
+
+        if (!name) {
+
+            alert(
+                "Ingrese un nombre para el trabajo."
+            );
+
+            return;
+        }
+
+
+        if (!responsible) {
+
+            alert(
+                "Ingrese el responsable del trabajo."
+            );
+
+            return;
+        }
+
+
+        createWorkButton.disabled = true;
+        createWorkButton.textContent = "Creando...";
+
+
+        try {
+
+            const r =
+                await fetch(
+                    "/api/work/create",
+                    {
+                        method: "POST",
+
+                        headers: {
+                            "Content-Type":
+                                "application/json"
+                        },
+
+                        body:
+                            JSON.stringify({
+                                name,
+                                responsible
+                            })
+                    }
+                );
+
+
+            const j =
+                await r.json();
+
+
+            if (!r.ok || j.error) {
+
+                alert(
+                    j.error ||
+                    "No se pudo crear el trabajo."
+                );
+
+                return;
+            }
+
+
+            renderWorkState(
+                j.state
+            );
+
+
+            const code =
+                j.work_code;
+
+            const key =
+                j.access_key;
+
+
+            const createdCode =
+                document.getElementById(
+                    "createdWorkCode"
+                );
+
+            const createdKey =
+                document.getElementById(
+                    "createdWorkKey"
+                );
+
+
+            if (createdCode) {
+                createdCode.textContent = code;
+            }
+
+            if (createdKey) {
+                createdKey.textContent = key;
+            }
+
+
+            showWorkMessage(
+
+                '<strong>Trabajo creado correctamente.</strong><br><br>' +
+
+                'Código de trabajo: ' +
+
+                '<strong>' +
+                escapeHtml(code) +
+                '</strong><br>' +
+
+                'Clave de acceso: ' +
+
+                '<strong>' +
+                escapeHtml(key) +
+                '</strong><br><br>' +
+
+                '<strong>Guardá ambos datos.</strong> ' +
+
+                'Los vas a necesitar para abrir este trabajo ' +
+                'desde otra computadora o compartirlo con otra persona del equipo.',
+
+                "warning"
+            );
+
+
+            alert(
+                "Trabajo creado.\n\n" +
+                "Código: " +
+                code +
+                "\n" +
+                "Clave: " +
+                key +
+                "\n\n" +
+                "Guardá ambos datos."
+            );
+
+
+        } catch (err) {
+
+            alert(
+                "Error al crear el trabajo: " +
+                err.message
+            );
+
+        } finally {
+
+            createWorkButton.disabled = false;
+
+            createWorkButton.textContent =
+                "Crear y guardar trabajo";
+        }
+    };
+}
+
+
+// =========================================================
+// ABRIR TRABAJO EXISTENTE
+// =========================================================
+
+const openWorkButton =
+    document.getElementById("openWork");
+
+
+if (openWorkButton) {
+
+    openWorkButton.onclick = async () => {
+
+        const workCode =
+            document
+                .getElementById("openWorkCode")
+                .value
+                .trim();
+
+        const accessKey =
+            document
+                .getElementById("openWorkKey")
+                .value
+                .trim();
+
+
+        if (!workCode || !accessKey) {
+
+            alert(
+                "Ingrese el Código de trabajo y la Clave de acceso."
+            );
+
+            return;
+        }
+
+
+        openWorkButton.disabled = true;
+        openWorkButton.textContent = "Abriendo...";
+
+
+        try {
+
+            const r =
+                await fetch(
+                    "/api/work/open",
+                    {
+                        method: "POST",
+
+                        headers: {
+                            "Content-Type":
+                                "application/json"
+                        },
+
+                        body:
+                            JSON.stringify({
+                                work_code:
+                                    workCode,
+
+                                access_key:
+                                    accessKey
+                            })
+                    }
+                );
+
+
+            const j =
+                await r.json();
+
+
+            if (!r.ok || j.error) {
+
+                alert(
+                    j.error ||
+                    "No se pudo abrir el trabajo."
+                );
+
+                return;
+            }
+
+
+            await restoreProjectState(
+                j.state
+            );
+
+
+            renderWorkState(
+                j.state
+            );
+
+
+            showWorkMessage(
+
+                "Trabajo " +
+                escapeHtml(
+                    j.state.work.work_code
+                ) +
+                " recuperado correctamente.",
+
+                "success"
+            );
+
+
+            document
+                .getElementById("openWorkKey")
+                .value = "";
+
+
+        } catch (err) {
+
+            alert(
+                "Error al abrir el trabajo: " +
+                err.message
+            );
+
+        } finally {
+
+            openWorkButton.disabled = false;
+
+            openWorkButton.textContent =
+                "Abrir trabajo";
+        }
+    };
+}
+
+
+// =========================================================
+// GUARDAR TRABAJO
+// =========================================================
+
+const saveWorkButton =
+    document.getElementById("saveWork");
+
+
+if (saveWorkButton) {
+
+    saveWorkButton.onclick = async () => {
+
+        saveWorkButton.disabled = true;
+        saveWorkButton.textContent = "Guardando...";
+
+        try {
+
+            const r =
+                await fetch(
+                    "/api/work/save",
+                    {
+                        method: "POST"
+                    }
+                );
+
+            const j =
+                await r.json();
+
+
+            if (!r.ok || j.error) {
+
+                if (j.conflict) {
+
+                    alert(
+                        j.error +
+                        "\n\nVolvé a abrir el trabajo antes de continuar."
+                    );
+
+                } else {
+
+                    alert(
+                        j.error ||
+                        "No se pudo guardar el trabajo."
+                    );
+                }
+
+                return;
+            }
+
+
+            showWorkMessage(
+
+                "Trabajo " +
+                escapeHtml(
+                    j.work_code
+                ) +
+                " guardado correctamente.",
+
+                "success"
+            );
+
+
+        } catch (err) {
+
+            alert(
+                "Error al guardar: " +
+                err.message
+            );
+
+        } finally {
+
+            saveWorkButton.disabled = false;
+            saveWorkButton.textContent = "Guardar trabajo";
+        }
+    };
+}
+
+
+// =========================================================
+// CERRAR TRABAJO
+// =========================================================
+
+const closeWorkButton =
+    document.getElementById("closeWork");
+
+
+if (closeWorkButton) {
+
+    closeWorkButton.onclick = async () => {
+
+        const ok =
+            confirm(
+                "¿Querés cerrar el trabajo actual?\n\n" +
+                "El trabajo quedará guardado en la base " +
+                "y podrás volver a abrirlo con su Código y Clave."
+            );
+
+
+        if (!ok) return;
+
+
+        try {
+
+            const r =
+                await fetch(
+                    "/api/work/close",
+                    {
+                        method: "POST"
+                    }
+                );
+
+
+            const j =
+                await r.json();
+
+
+            if (!r.ok || j.error) {
+
+                alert(
+                    j.error ||
+                    "No se pudo cerrar el trabajo."
+                );
+
+                return;
+            }
+
+
+            resetAuditUI();
+
+
+            renderWorkState(
+                j.state
+            );
+
+
+            showWorkMessage(
+
+                "Trabajo cerrado. Podés crear uno nuevo o abrir un trabajo existente.",
+
+                "success"
+            );
+
+
+        } catch (err) {
+
+            alert(
+                "Error al cerrar el trabajo: " +
+                err.message
+            );
+        }
+    };
+}
+
+
+// =========================================================
+// RESTAURAR TRABAJO DESDE POSTGRESQL
+// =========================================================
+
+async function restoreProjectState(state) {
+
+    resetAuditUI(false);
+
+
+    if (!state) {
+        return;
+    }
+
+
+    // -----------------------------------------------------
+    // MAPPING
+    // -----------------------------------------------------
+
+    mapping = {};
+
+
+    const storedMapping =
+        state.mapping || {};
+
+
+    Object.entries(
+        storedMapping
+    ).forEach(
+        ([key, value]) => {
+
+            if (!value) return;
+
+            if (
+                key.endsWith("_col")
+            ) {
+
+                const role =
+                    key.substring(
+                        0,
+                        key.length - 4
+                    );
+
+                mapping[role] =
+                    value;
+
+            } else {
+
+                mapping[key] =
+                    value;
+            }
+        }
+    );
+
+
+    // -----------------------------------------------------
+    // POBLACIÓN
+    // -----------------------------------------------------
+
+    if (state.population) {
+
+        population =
+            state.population;
+
+
+        const columns =
+            state.population.columns ||
+            [];
+
+
+        renderMappingControls(
+            columns,
+            mapping
+        );
+
+
+        mappingCard.style.display =
+            "block";
+
+
+        renderPreviewTable(
+
+            columns,
+
+            state.population.preview ||
+            []
+        );
+
+
+        document
+            .getElementById(
+                "N"
+            )
+            .value =
+                state.population.rows ||
+                0;
+
+
+        if (
+            state.population.analysis
+        ) {
+
+            renderPopulationAnalysis(
+                state.population.analysis
+            );
+        }
+
+
+        const sourceName =
+            state.work &&
+            state.work.source_name
+
+                ? state.work.source_name
+
+                : "Población recuperada";
+
+
+        document
+            .getElementById(
+                "fileStatus"
+            )
+            .textContent =
+
+                sourceName +
+
+                " (" +
+
+                (
+                    state.population.rows ||
+                    0
+                ) +
+
+                " filas)";
+    }
+
+
+    // -----------------------------------------------------
+    // PARÁMETROS
+    // -----------------------------------------------------
+
+    restoreDesignParameters(
+        state.params || {}
+    );
+
+
+    // -----------------------------------------------------
+    // MUESTRA
+    // -----------------------------------------------------
+
+    sample =
+
+        state.sample &&
+        Array.isArray(
+            state.sample.preview
+        )
+
+            ? state.sample.preview
+
+            : [];
+
+
+    lastSelectionCode =
+
+        state.params &&
+        state.params.seed
+
+            ? state.params.seed
+
+            : null;
+
+
+    if (
+        state.sample &&
+        state.sample.rows
+    ) {
+
+        renderRestoredSampleSummary(
+            state
+        );
+
+
+        const repeatArea =
+            document.getElementById(
+                "repeatArea"
+            );
+
+
+        if (repeatArea) {
+
+            repeatArea.style.display =
+                "flex";
+        }
+
+
+        renderSampleTable();
+    }
+
+
+    // -----------------------------------------------------
+    // RESULTADOS
+    // -----------------------------------------------------
+
+    results = {};
+
+
+    if (
+        Array.isArray(
+            state.results
+        )
+    ) {
+
+        state.results.forEach(
+            item => {
+
+                if (
+                    item._original_index === undefined ||
+                    item._original_index === null
+                ) {
+                    return;
+                }
+
+
+                results[
+                    String(
+                        item._original_index
+                    )
+                ] = {
+
+                    status:
+                        item.status || "",
+
+                    registered:
+                        item.registered !== undefined
+                            ? item.registered
+                            : "",
+
+                    validated:
+                        item.validated !== undefined
+                            ? item.validated
+                            : "",
+
+                    difference:
+                        item.difference !== undefined
+                            ? item.difference
+                            : "",
+
+                    exception_type:
+                        item.exception_type || "",
+
+                    comment:
+                        item.comment || "",
+
+                    evidence:
+                        item.evidence || ""
+                };
+            }
+        );
+    }
+
+
+    renderResultsTable();
+
+
+    if (sample.length) {
+
+        try {
+            await updateExtrapolation();
+        } catch (_) {
+            // No interrumpe la restauración.
+        }
+    }
+}
+
+
+function restoreDesignParameters(params) {
+
+    if (!params) return;
+
+
+    if (
+        params.confidence !== undefined
+    ) {
+
+        document
+            .getElementById(
+                "confidence"
+            )
+            .value =
+                String(
+                    params.confidence
+                );
+    }
+
+
+    if (
+        params.error !== undefined
+    ) {
+
+        document
+            .getElementById(
+                "error"
+            )
+            .value =
+                params.error;
+    }
+
+
+    if (
+        params.p !== undefined
+    ) {
+
+        document
+            .getElementById(
+                "p"
+            )
+            .value =
+                params.p;
+
+
+        document
+            .getElementById(
+                "q"
+            )
+            .value =
+                (
+                    1 -
+                    Number(
+                        params.p
+                    )
+                ).toFixed(2);
+    }
+
+
+    document
+        .getElementById(
+            "materiality"
+        )
+        .value =
+
+            params.materiality !== undefined
+
+                ? params.materiality
+
+                : "";
+
+
+    document
+        .getElementById(
+            "tolerable"
+        )
+        .value =
+
+            params.tolerable_error !== undefined
+
+                ? params.tolerable_error
+
+                : "";
+
+
+    document
+        .getElementById(
+            "threshold"
+        )
+        .value =
+
+            params.significant_threshold !== undefined
+
+                ? params.significant_threshold
+
+                : "";
+
+
+    document
+        .getElementById(
+            "incMat"
+        )
+        .checked =
+
+            Boolean(
+                params.include_materiality
+            );
+
+
+    document
+        .getElementById(
+            "incOut"
+        )
+        .checked =
+
+            Boolean(
+                params.include_outliers
+            );
+
+
+    if (
+        params.method
+    ) {
+
+        const radio =
+            document.querySelector(
+                'input[name="method"][value="' +
+                params.method +
+                '"]'
+            );
+
+
+        if (radio) {
+
+            radio.checked =
+                true;
+        }
+    }
+
+
+    document
+        .getElementById(
+            "nResult"
+        )
+        .textContent =
+
+            params.n
+                ? params.n
+                : "-";
+}
+
+
+function renderRestoredSampleSummary(state) {
+
+    const params =
+        state.params || {};
+
+
+    const populationRows =
+
+        state.population
+            ? state.population.rows || 0
+            : 0;
+
+
+    const sampleRows =
+
+        state.sample
+            ? state.sample.rows || 0
+            : 0;
+
+
+    const coverageCount =
+
+        populationRows
+
+            ? sampleRows /
+              populationRows *
+              100
+
+            : 0;
+
+
+    let coverageAmountText =
+        "-";
+
+
+    const amountCol =
+        mapping.amount;
+
+
+    const analysis =
+
+        state.population
+            ? state.population.analysis
+            : null;
+
+
+    if (
+        amountCol &&
+        analysis &&
+        analysis.amount_abs_total &&
+        sample.length === sampleRows
+    ) {
+
+        const selectedAmount =
+
+            sample.reduce(
+                (total, row) => {
+
+                    const number =
+                        Number(
+                            row[amountCol]
+                        );
+
+                    return total +
+
+                        (
+                            Number.isFinite(
+                                number
+                            )
+
+                                ? Math.abs(
+                                    number
+                                )
+
+                                : 0
+                        );
+                },
+                0
+            );
+
+
+        coverageAmountText =
+
+            (
+                selectedAmount /
+                analysis.amount_abs_total *
+                100
+            ).toFixed(2) +
+
+            "%";
+    }
+
+
+    const methodLabels = {
+
+        random:
+            "Aleatorio simple",
+
+        systematic:
+            "Sistemático",
+
+        stratified:
+            "Estratificado",
+
+        mus:
+            "MUS / PPS",
+
+        topn:
+            "Top N"
+    };
+
+
+    document
+        .getElementById(
+            "sampleSummary"
+        )
+        .innerHTML =
+
+
+            '<div class="summary-item">' +
+
+                '<span class="summary-label">' +
+                    'Tamaño' +
+                '</span>' +
+
+                '<span class="summary-value">' +
+                    sampleRows +
+                '</span>' +
+
+            '</div>' +
+
+
+            '<div class="summary-item">' +
+
+                '<span class="summary-label">' +
+                    'Cobertura registros' +
+                '</span>' +
+
+                '<span class="summary-value">' +
+                    coverageCount.toFixed(2) +
+                    '%' +
+                '</span>' +
+
+            '</div>' +
+
+
+            '<div class="summary-item">' +
+
+                '<span class="summary-label">' +
+                    'Cobertura monetaria' +
+                '</span>' +
+
+                '<span class="summary-value">' +
+                    coverageAmountText +
+                '</span>' +
+
+            '</div>' +
+
+
+            '<div class="summary-item code-pill">' +
+
+                '<span class="summary-label">' +
+                    'Código de selección' +
+                '</span>' +
+
+                '<span class="summary-value">' +
+                    (
+                        params.seed ||
+                        "-"
+                    ) +
+                '</span>' +
+
+            '</div>' +
+
+
+            '<div class="summary-item">' +
+
+                '<span class="summary-label">' +
+                    'Método' +
+                '</span>' +
+
+                '<span class="summary-value">' +
+
+                    (
+                        methodLabels[
+                            params.method
+                        ] ||
+
+                        params.method ||
+
+                        "-"
+                    ) +
+
+                '</span>' +
+
+            '</div>';
+}
+
+
+// =========================================================
+// RESETEAR INTERFAZ
+// =========================================================
+
+function resetAuditUI(clearWorkMessage = true) {
+
+    population = null;
+    mapping = {};
+    sample = [];
+    results = {};
+    lastSelectionCode = null;
+
+
+    mappingDiv.innerHTML =
+        "";
+
+
+    mappingCard.style.display =
+        "none";
+
+
+    document
+        .getElementById(
+            "populationResults"
+        )
+        .style.display =
+            "none";
+
+
+    preview.innerHTML =
+        "";
+
+
+    popKpis.innerHTML =
+        "";
+
+
+    quality.innerHTML =
+        "";
+
+
+    document
+        .getElementById(
+            "N"
+        )
+        .value =
+            "";
+
+
+    document
+        .getElementById(
+            "nResult"
+        )
+        .textContent =
+            "-";
+
+
+    document
+        .getElementById(
+            "sampleSummary"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "sampleTable"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "resultsTable"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "resultsDash"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "observed"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "projected"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "extraWarning"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "summary"
+        )
+        .innerHTML =
+            "";
+
+
+    document
+        .getElementById(
+            "conclusion"
+        )
+        .textContent =
+            "Genere y evalúe la muestra para obtener el resumen.";
+
+
+    document
+        .getElementById(
+            "fileStatus"
+        )
+        .textContent =
+            "Sin población cargada";
+
+
+    const repeatArea =
+        document.getElementById(
+            "repeatArea"
+        );
+
+
+    if (repeatArea) {
+
+        repeatArea.style.display =
+            "none";
+    }
+
+
+    if (clearWorkMessage) {
+
+        showWorkMessage("");
+    }
+}
 
 
 // =========================================================
 // CARGA DE ARCHIVO
 // =========================================================
 
-drop.onclick = () => file.click();
+drop.onclick =
+    () => file.click();
 
-file.onchange = upload;
+
+file.onchange =
+    upload;
 
 
 drop.ondragover = e => {
@@ -64,23 +1478,30 @@ drop.ondragover = e => {
 };
 
 
-drop.ondragleave = () => {
+drop.ondragleave =
+    () => {
 
-    drop.style.borderColor = "";
-};
+        drop.style.borderColor =
+            "";
+    };
 
 
 drop.ondrop = e => {
 
     e.preventDefault();
 
-    drop.style.borderColor = "";
+    drop.style.borderColor =
+        "";
 
-    if (e.dataTransfer.files.length) {
+
+    if (
+        e.dataTransfer.files.length
+    ) {
 
         upload({
             target: {
-                files: e.dataTransfer.files
+                files:
+                    e.dataTransfer.files
             }
         });
     }
@@ -89,14 +1510,21 @@ drop.ondrop = e => {
 
 async function upload(e) {
 
-    const f = e.target.files[0];
+    const f =
+        e.target.files[0];
+
 
     if (!f) return;
 
 
-    const fd = new FormData();
+    const fd =
+        new FormData();
 
-    fd.append("file", f);
+
+    fd.append(
+        "file",
+        f
+    );
 
 
     msg.innerHTML =
@@ -109,8 +1537,11 @@ async function upload(e) {
             await fetch(
                 "/api/upload",
                 {
-                    method: "POST",
-                    body: fd
+                    method:
+                        "POST",
+
+                    body:
+                        fd
                 }
             );
 
@@ -119,30 +1550,21 @@ async function upload(e) {
             await r.json();
 
 
-        if (j.error) {
+        if (
+            !r.ok ||
+            j.error
+        ) {
+
+            alert(
+                j.error ||
+                "No se pudo cargar la población."
+            );
 
             msg.innerHTML =
-                j.error;
+                j.error || "";
 
             return;
         }
-
-
-        msg.innerHTML =
-            "Archivo: " +
-            f.name +
-            " (" +
-            j.rows +
-            " filas)";
-
-
-        document
-            .getElementById("fileStatus")
-            .textContent =
-                f.name +
-                " (" +
-                j.rows +
-                " filas)";
 
 
         mapping = {};
@@ -151,130 +1573,92 @@ async function upload(e) {
         lastSelectionCode = null;
 
 
-        const repeatArea =
-            document.getElementById("repeatArea");
+        msg.innerHTML =
 
-        if (repeatArea) {
+            "Archivo: " +
 
-            repeatArea.style.display =
-                "none";
-        }
+            f.name +
+
+            " (" +
+
+            j.rows +
+
+            " filas)";
 
 
-        mappingDiv.innerHTML = "";
+        document
+            .getElementById(
+                "fileStatus"
+            )
+            .textContent =
+
+                f.name +
+
+                " (" +
+
+                j.rows +
+
+                " filas)";
 
 
-        j.columns.forEach(c => {
-
-            mappingDiv.innerHTML +=
-
-                '<div class="form-group">' +
-
-                    '<label>' +
-                        c +
-                    '</label>' +
-
-                    '<select ' +
-                        'class="col-map" ' +
-                        'data-col="' +
-                        c +
-                    '">' +
-
-                        '<option value="">' +
-                            'Ignorar' +
-                        '</option>' +
-
-                        '<option value="id">' +
-                            'ID' +
-                        '</option>' +
-
-                        '<option value="amount">' +
-                            'Importe' +
-                        '</option>' +
-
-                        '<option value="date">' +
-                            'Fecha' +
-                        '</option>' +
-
-                        '<option value="vendor">' +
-                            'Proveedor' +
-                        '</option>' +
-
-                        '<option value="company">' +
-                            'Sociedad' +
-                        '</option>' +
-
-                        '<option value="center">' +
-                            'Centro' +
-                        '</option>' +
-
-                        '<option value="user">' +
-                            'Usuario' +
-                        '</option>' +
-
-                        '<option value="doctype">' +
-                            'Tipo Doc' +
-                        '</option>' +
-
-                        '<option value="account">' +
-                            'Cuenta' +
-                        '</option>' +
-
-                    '</select>' +
-
-                '</div>';
-        });
+        renderMappingControls(
+            j.columns,
+            {}
+        );
 
 
         mappingCard.style.display =
             "block";
 
 
-        population = j;
+        population =
+            j;
 
 
-        preview.innerHTML =
+        renderPreviewTable(
+            j.columns,
+            j.preview
+        );
 
-            "<thead><tr>" +
 
-                j.columns
-                    .map(c =>
-                        "<th>" +
-                        c +
-                        "</th>"
-                    )
-                    .join("") +
+        document
+            .getElementById(
+                "populationResults"
+            )
+            .style.display =
+                "none";
 
-            "</tr></thead>" +
 
-            "<tbody>" +
+        document
+            .getElementById(
+                "sampleSummary"
+            )
+            .innerHTML =
+                "";
 
-                j.preview
-                    .map(row =>
 
-                        "<tr>" +
+        document
+            .getElementById(
+                "sampleTable"
+            )
+            .innerHTML =
+                "";
 
-                            j.columns
-                                .map(c =>
 
-                                    "<td>" +
-                                    (
-                                        row[c] !== undefined &&
-                                        row[c] !== null
-                                            ? row[c]
-                                            : ""
-                                    ) +
-                                    "</td>"
+        document
+            .getElementById(
+                "resultsTable"
+            )
+            .innerHTML =
+                "";
 
-                                )
-                                .join("") +
 
-                        "</tr>"
-
-                    )
-                    .join("") +
-
-            "</tbody>";
+        document
+            .getElementById(
+                "resultsDash"
+            )
+            .innerHTML =
+                "";
 
 
     } catch (err) {
@@ -287,64 +1671,306 @@ async function upload(e) {
 
 
 // =========================================================
+// MAPEO
+// =========================================================
+
+function renderMappingControls(
+    columns,
+    restoredMapping = {}
+) {
+
+    mappingDiv.innerHTML =
+        "";
+
+
+    const roleByColumn =
+        {};
+
+
+    Object.entries(
+        restoredMapping
+    ).forEach(
+        ([role, column]) => {
+
+            if (column) {
+                roleByColumn[column] =
+                    role;
+            }
+        }
+    );
+
+
+    columns.forEach(
+        column => {
+
+            const selectedRole =
+                roleByColumn[column] ||
+                "";
+
+
+            mappingDiv.innerHTML +=
+
+                '<div class="form-group">' +
+
+                    '<label>' +
+                        escapeHtml(column) +
+                    '</label>' +
+
+                    '<select ' +
+                        'class="col-map" ' +
+                        'data-col="' +
+                        escapeAttribute(column) +
+                    '">' +
+
+                        mappingOption(
+                            "",
+                            "Ignorar",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "id",
+                            "ID",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "amount",
+                            "Importe",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "date",
+                            "Fecha",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "vendor",
+                            "Proveedor",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "company",
+                            "Sociedad",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "center",
+                            "Centro",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "user",
+                            "Usuario",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "doctype",
+                            "Tipo Doc",
+                            selectedRole
+                        ) +
+
+                        mappingOption(
+                            "account",
+                            "Cuenta",
+                            selectedRole
+                        ) +
+
+                    '</select>' +
+
+                '</div>';
+        }
+    );
+}
+
+
+function mappingOption(
+    value,
+    label,
+    selected
+) {
+
+    return (
+
+        '<option value="' +
+        value +
+        '"' +
+
+        (
+            value === selected
+                ? " selected"
+                : ""
+        ) +
+
+        '>' +
+
+        label +
+
+        '</option>'
+    );
+}
+
+
+// =========================================================
+// PREVIEW
+// =========================================================
+
+function renderPreviewTable(
+    columns,
+    rows
+) {
+
+    preview.innerHTML =
+
+        "<thead><tr>" +
+
+        columns
+            .map(
+                column =>
+                    "<th>" +
+                    escapeHtml(column) +
+                    "</th>"
+            )
+            .join("") +
+
+        "</tr></thead>" +
+
+
+        "<tbody>" +
+
+        rows
+            .map(
+                row =>
+
+                    "<tr>" +
+
+                    columns
+                        .map(
+                            column =>
+
+                                "<td>" +
+
+                                escapeHtml(
+                                    displayValue(
+                                        row[column]
+                                    )
+                                ) +
+
+                                "</td>"
+                        )
+                        .join("") +
+
+                    "</tr>"
+            )
+            .join("") +
+
+        "</tbody>";
+}
+
+
+// =========================================================
 // ANÁLISIS DE POBLACIÓN
 // =========================================================
 
-analyze.onclick = async () => {
+analyze.onclick =
+    async () => {
 
-    mapping = {};
-
-
-    document
-        .querySelectorAll(".col-map")
-        .forEach(s => {
-
-            if (s.value) {
-
-                mapping[s.value] =
-                    s.dataset.col;
-            }
-        });
+        mapping =
+            {};
 
 
-    if (!mapping.id || !mapping.amount) {
+        document
+            .querySelectorAll(
+                ".col-map"
+            )
+            .forEach(
+                select => {
 
-        alert(
-            "Seleccione ID e Importe"
+                    if (
+                        select.value
+                    ) {
+
+                        mapping[
+                            select.value
+                        ] =
+                            select.dataset.col;
+                    }
+                }
+            );
+
+
+        if (
+            !mapping.id ||
+            !mapping.amount
+        ) {
+
+            alert(
+                "Seleccione ID e Importe."
+            );
+
+            return;
+        }
+
+
+        const r =
+            await fetch(
+                "/api/analyze",
+                {
+                    method:
+                        "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify(
+                            mapping
+                        )
+                }
+            );
+
+
+        const j =
+            await r.json();
+
+
+        if (
+            !r.ok ||
+            j.error
+        ) {
+
+            alert(
+                j.error ||
+                "No se pudo analizar la población."
+            );
+
+            return;
+        }
+
+
+        renderPopulationAnalysis(
+            j
         );
 
-        return;
-    }
+
+        document
+            .getElementById(
+                "N"
+            )
+            .value =
+                j.records;
+    };
 
 
-    const r =
-        await fetch(
-            "/api/analyze",
-            {
-                method: "POST",
-
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify(mapping)
-            }
-        );
-
-
-    const j =
-        await r.json();
-
-
-    if (j.error) {
-
-        alert(j.error);
-
-        return;
-    }
-
+function renderPopulationAnalysis(j) {
 
     document
         .getElementById(
@@ -356,116 +1982,147 @@ analyze.onclick = async () => {
 
     popKpis.innerHTML =
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Registros</div>' +
-            '<div class="kpi-value">' +
-                j.records.toLocaleString() +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Registros",
+            (
+                j.records ||
+                0
+            ).toLocaleString()
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Importe Total</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.amount_total || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Importe Total",
+            formatMoney(
+                j.amount_total || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Promedio</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.mean || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Promedio",
+            formatMoney(
+                j.mean || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Mediana</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.median || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Mediana",
+            formatMoney(
+                j.median || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Máximo</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.max || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Máximo",
+            formatMoney(
+                j.max || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Mínimo</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.min || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Mínimo",
+            formatMoney(
+                j.min || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Desv. Estándar</div>' +
-            '<div class="kpi-value">' +
-                formatMoney(j.std || 0) +
-            '</div>' +
-        '</div>' +
+        kpiCard(
+            "Desv. Estándar",
+            formatMoney(
+                j.std || 0
+            )
+        ) +
 
-        '<div class="kpi-card">' +
-            '<div class="kpi-label">Duplicados</div>' +
-            '<div class="kpi-value">' +
-                (j.duplicate_rows || 0) +
-            '</div>' +
-        '</div>';
+        kpiCard(
+            "Duplicados",
+            j.duplicate_rows || 0
+        );
 
 
     quality.innerHTML =
 
-        '<div class="quality-item">' +
-            '<span class="quality-label">Ceros</span>' +
-            '<span class="quality-value">' +
-                (j.zeros || 0) +
-            '</span>' +
-        '</div>' +
+        qualityItem(
+            "Ceros",
+            j.zeros || 0
+        ) +
+
+        qualityItem(
+            "Negativos",
+            j.negatives || 0
+        ) +
+
+        qualityItem(
+            "Outliers",
+            j.outliers || 0
+        ) +
+
+        qualityItem(
+            "Top 10",
+            (
+                j.top10_pct || 0
+            ).toFixed(1) +
+            "%"
+        ) +
+
+        qualityItem(
+            "Top 20",
+            (
+                j.top20_pct || 0
+            ).toFixed(1) +
+            "%"
+        ) +
+
+        qualityItem(
+            "Top 50",
+            (
+                j.top50_pct || 0
+            ).toFixed(1) +
+            "%"
+        );
+}
+
+
+function kpiCard(
+    label,
+    value
+) {
+
+    return (
+
+        '<div class="kpi-card">' +
+
+            '<div class="kpi-label">' +
+                label +
+            '</div>' +
+
+            '<div class="kpi-value">' +
+                value +
+            '</div>' +
+
+        '</div>'
+    );
+}
+
+
+function qualityItem(
+    label,
+    value
+) {
+
+    return (
 
         '<div class="quality-item">' +
-            '<span class="quality-label">Negativos</span>' +
-            '<span class="quality-value">' +
-                (j.negatives || 0) +
+
+            '<span class="quality-label">' +
+                label +
             '</span>' +
-        '</div>' +
 
-        '<div class="quality-item">' +
-            '<span class="quality-label">Outliers</span>' +
             '<span class="quality-value">' +
-                (j.outliers || 0) +
+                value +
             '</span>' +
-        '</div>' +
 
-        '<div class="quality-item">' +
-            '<span class="quality-label">Top 10</span>' +
-            '<span class="quality-value">' +
-                (j.top10_pct || 0).toFixed(1) +
-                '%' +
-            '</span>' +
-        '</div>' +
-
-        '<div class="quality-item">' +
-            '<span class="quality-label">Top 20</span>' +
-            '<span class="quality-value">' +
-                (j.top20_pct || 0).toFixed(1) +
-                '%' +
-            '</span>' +
-        '</div>' +
-
-        '<div class="quality-item">' +
-            '<span class="quality-label">Top 50</span>' +
-            '<span class="quality-value">' +
-                (j.top50_pct || 0).toFixed(1) +
-                '%' +
-            '</span>' +
-        '</div>';
-
-
-    document
-        .getElementById("N")
-        .value =
-            j.records;
-};
+        '</div>'
+    );
+}
 
 
 // =========================================================
@@ -480,16 +2137,21 @@ document
             const p =
                 parseFloat(
                     document
-                        .getElementById("p")
+                        .getElementById(
+                            "p"
+                        )
                         .value
                 ) || 0.5;
 
 
             document
-                .getElementById("q")
+                .getElementById(
+                    "q"
+                )
                 .value =
-                    (1 - p)
-                        .toFixed(2);
+                    (
+                        1 - p
+                    ).toFixed(2);
         };
 
 
@@ -500,32 +2162,40 @@ document
 
 
 // =========================================================
-// EXPLICACIÓN TAMAÑO MUESTRA
+// EXPLICACIÓN DEL TAMAÑO DE MUESTRA
 // =========================================================
 
 document
-    .getElementById("howSample")
+    .getElementById(
+        "howSample"
+    )
     .onclick =
         () => {
 
             const N =
                 parseInt(
                     document
-                        .getElementById("N")
+                        .getElementById(
+                            "N"
+                        )
                         .value
                 ) || 0;
 
 
             const conf =
                 document
-                    .getElementById("confidence")
+                    .getElementById(
+                        "confidence"
+                    )
                     .value;
 
 
             const e =
                 parseFloat(
                     document
-                        .getElementById("error")
+                        .getElementById(
+                            "error"
+                        )
                         .value
                 ) || 0.05;
 
@@ -533,7 +2203,9 @@ document
             const p =
                 parseFloat(
                     document
-                        .getElementById("p")
+                        .getElementById(
+                            "p"
+                        )
                         .value
                 ) || 0.5;
 
@@ -543,7 +2215,6 @@ document
 
 
             const zmap = {
-
                 "90": 1.645,
                 "95": 1.96,
                 "97": 2.17,
@@ -570,7 +2241,9 @@ document
                 (
                     e *
                     e *
-                    (N - 1)
+                    (
+                        N - 1
+                    )
 
                     +
 
@@ -582,63 +2255,57 @@ document
 
 
             document
-                .getElementById("modalText")
+                .getElementById(
+                    "modalText"
+                )
                 .innerHTML =
 
-                    '<p>' +
+                    '<p><strong>Fórmula</strong>: ' +
 
-                        '<strong>Fórmula</strong>: ' +
+                    'n = (Z² × p × q × N) / ' +
 
-                        'n = (Z² × p × q × N) / ' +
+                    '[e² × (N-1) + Z² × p × q]</p>' +
 
-                        '[e² × (N-1) + Z² × p × q]' +
+                    '<p><strong>Variables</strong>:<br>' +
 
-                    '</p>' +
+                    'Z = ' +
+                    z +
+                    ' (confianza ' +
+                    conf +
+                    '%)<br>' +
 
+                    'p = ' +
+                    p +
+                    '<br>' +
 
-                    '<p>' +
+                    'q = ' +
+                    q.toFixed(2) +
+                    '<br>' +
 
-                        '<strong>Variables</strong>:<br>' +
+                    'N = ' +
+                    N +
+                    '<br>' +
 
-                        'Z = ' +
-                        z +
-                        ' (confianza ' +
-                        conf +
-                        '%)<br>' +
-
-                        'p = ' +
-                        p +
-                        '<br>' +
-
-                        'q = ' +
-                        q.toFixed(2) +
-                        '<br>' +
-
-                        'N = ' +
-                        N +
-                        '<br>' +
-
-                        'e = ' +
-                        e +
+                    'e = ' +
+                    e +
 
                     '</p>' +
 
+                    '<p><strong>Resultado</strong>: n = ' +
 
-                    '<p>' +
+                    Math.ceil(n) +
 
-                        '<strong>Resultado</strong>: n = ' +
-
-                        Math.ceil(n) +
-
-                        ' registros' +
-
-                    '</p>';
+                    ' registros</p>';
 
 
             document
-                .getElementById("modal")
+                .getElementById(
+                    "modal"
+                )
                 .classList
-                .add("active");
+                .add(
+                    "active"
+                );
         };
 
 
@@ -658,9 +2325,13 @@ if (modalClose) {
         () => {
 
             document
-                .getElementById("modal")
+                .getElementById(
+                    "modal"
+                )
                 .classList
-                .remove("active");
+                .remove(
+                    "active"
+                );
         };
 }
 
@@ -670,15 +2341,18 @@ if (modalClose) {
 // =========================================================
 
 document
-    .getElementById("recommend")
+    .getElementById(
+        "recommend"
+    )
     .onclick =
         async () => {
 
-
-            if (!mapping.amount) {
+            if (
+                !mapping.amount
+            ) {
 
                 alert(
-                    "Analice la población primero"
+                    "Analice la población primero."
                 );
 
                 return;
@@ -689,17 +2363,16 @@ document
                 await fetch(
                     "/api/recommend",
                     {
-                        method: "POST",
+                        method:
+                            "POST",
 
                         headers: {
-
                             "Content-Type":
                                 "application/json"
                         },
 
                         body:
                             JSON.stringify({
-
                                 amount_col:
                                     mapping.amount,
 
@@ -711,7 +2384,6 @@ document
                                             )
                                             .value
                                     ) || 0
-
                             })
                     }
                 );
@@ -721,19 +2393,24 @@ document
                 await r.json();
 
 
-            if (j.error) {
+            if (
+                !r.ok ||
+                j.error
+            ) {
 
-                alert(j.error);
+                alert(
+                    j.error ||
+                    "No se pudo generar la recomendación."
+                );
 
                 return;
             }
 
 
             const box =
-                document
-                    .getElementById(
-                        "recommendationBox"
-                    );
+                document.getElementById(
+                    "recommendationBox"
+                );
 
 
             box.style.display =
@@ -742,43 +2419,31 @@ document
 
             box.innerHTML =
 
-                '<p>' +
+                '<p><strong>Recomendación</strong>: ' +
 
-                    '<strong>' +
-                        'Recomendación' +
-                    '</strong>: ' +
-
-                    j.recommendation +
+                j.recommendation +
 
                 '</p>' +
 
-
-                '<p>' +
-
-                    '<strong>' +
-                        'Razones' +
-                    '</strong>:' +
-
-                '</p>' +
-
+                '<p><strong>Razones</strong>:</p>' +
 
                 '<ul>' +
 
-                    j.reasons
-                        .map(
-                            x =>
-                                "<li>" +
-                                x +
-                                "</li>"
-                        )
-                        .join("") +
+                j.reasons
+                    .map(
+                        reason =>
+                            "<li>" +
+                            escapeHtml(reason) +
+                            "</li>"
+                    )
+                    .join("") +
 
                 '</ul>';
         };
 
 
 // =========================================================
-// GENERACIÓN Y REPRODUCCIÓN DE MUESTRA
+// GENERAR / REPETIR MUESTRA
 // =========================================================
 
 async function generateSample(
@@ -792,7 +2457,7 @@ async function generateSample(
     ) {
 
         alert(
-            "Analice la población primero"
+            "Analice la población primero."
         );
 
         return;
@@ -802,21 +2467,27 @@ async function generateSample(
     const N =
         parseInt(
             document
-                .getElementById("N")
+                .getElementById(
+                    "N"
+                )
                 .value
         ) || 0;
 
 
     const conf =
         document
-            .getElementById("confidence")
+            .getElementById(
+                "confidence"
+            )
             .value;
 
 
     const e =
         parseFloat(
             document
-                .getElementById("error")
+                .getElementById(
+                    "error"
+                )
                 .value
         ) || 0.05;
 
@@ -824,19 +2495,21 @@ async function generateSample(
     const p =
         parseFloat(
             document
-                .getElementById("p")
+                .getElementById(
+                    "p"
+                )
                 .value
         ) || 0.5;
 
 
-    const r =
+    const calcResponse =
         await fetch(
             "/api/calculate-sample",
             {
-                method: "POST",
+                method:
+                    "POST",
 
                 headers: {
-
                     "Content-Type":
                         "application/json"
                 },
@@ -844,30 +2517,40 @@ async function generateSample(
                 body:
                     JSON.stringify({
                         N,
-                        confidence: conf,
-                        error: e,
+                        confidence:
+                            conf,
+                        error:
+                            e,
                         p
                     })
             }
         );
 
 
-    const j =
-        await r.json();
+    const calc =
+        await calcResponse.json();
 
 
-    if (j.error) {
+    if (
+        !calcResponse.ok ||
+        calc.error
+    ) {
 
-        alert(j.error);
+        alert(
+            calc.error ||
+            "No se pudo calcular el tamaño de muestra."
+        );
 
         return;
     }
 
 
     document
-        .getElementById("nResult")
+        .getElementById(
+            "nResult"
+        )
         .textContent =
-            j.n;
+            calc.n;
 
 
     const method =
@@ -876,25 +2559,6 @@ async function generateSample(
                 'input[name="method"]:checked'
             )
             .value;
-
-
-    const methodLabels = {
-
-        random:
-            "Aleatorio simple",
-
-        systematic:
-            "Sistemático",
-
-        stratified:
-            "Estratificado",
-
-        mus:
-            "MUS / PPS",
-
-        topn:
-            "Top N"
-    };
 
 
     const payload = {
@@ -908,7 +2572,7 @@ async function generateSample(
         method,
 
         n:
-            j.n,
+            calc.n,
 
         confidence:
             conf,
@@ -918,195 +2582,144 @@ async function generateSample(
 
         p,
 
-
         seed:
+
             selectionCode !== null
 
                 ? selectionCode
 
                 : Date.now(),
 
-
         include_materiality:
-            document
-                .getElementById("incMat")
-                .checked,
 
+            document
+                .getElementById(
+                    "incMat"
+                )
+                .checked,
 
         include_outliers:
+
             document
-                .getElementById("incOut")
+                .getElementById(
+                    "incOut"
+                )
                 .checked,
 
-
         significant_threshold:
+
             parseFloat(
                 document
-                    .getElementById("threshold")
+                    .getElementById(
+                        "threshold"
+                    )
                     .value
             ) || 0,
-
 
         materiality:
+
             parseFloat(
                 document
-                    .getElementById("materiality")
+                    .getElementById(
+                        "materiality"
+                    )
                     .value
             ) || 0,
 
-
         tolerable_error:
+
             parseFloat(
                 document
-                    .getElementById("tolerable")
+                    .getElementById(
+                        "tolerable"
+                    )
                     .value
             ) || 0
     };
 
 
-    const s =
+    const r =
         await fetch(
             "/api/generate-sample",
             {
-                method: "POST",
+                method:
+                    "POST",
 
                 headers: {
-
                     "Content-Type":
                         "application/json"
                 },
 
                 body:
-                    JSON.stringify(payload)
+                    JSON.stringify(
+                        payload
+                    )
             }
         );
 
 
-    const sj =
-        await s.json();
+    const j =
+        await r.json();
 
 
-    if (sj.error) {
+    if (
+        !r.ok ||
+        j.error
+    ) {
 
-        alert(sj.error);
+        if (
+            j.conflict
+        ) {
+
+            alert(
+                j.error +
+                "\n\nVolvé a abrir el trabajo antes de continuar."
+            );
+
+        } else {
+
+            alert(
+                j.error ||
+                "No se pudo generar la muestra."
+            );
+        }
 
         return;
     }
 
 
     sample =
-        sj.preview || [];
+        j.preview || [];
 
 
     lastSelectionCode =
-        sj.seed;
+        j.seed;
 
 
-    if (!isRepeat) {
+    if (
+        !isRepeat
+    ) {
 
-        results = {};
+        results =
+            {};
     }
 
 
-    document
-        .getElementById(
-            "sampleSummary"
-        )
-        .innerHTML =
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Tamaño' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    (sj.rows || 0) +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Cobertura registros' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-
-                    (
-                        sj.coverage_count ||
-                        0
-                    ).toFixed(2) +
-
-                    '%' +
-
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Cobertura monetaria' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-
-                    (
-                        sj.coverage_amount ||
-                        0
-                    ).toFixed(2) +
-
-                    '%' +
-
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item code-pill">' +
-
-                '<span class="summary-label">' +
-                    'Código de selección' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    lastSelectionCode +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Método' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-
-                    (
-                        methodLabels[method] ||
-                        method
-                    ) +
-
-                '</span>' +
-
-            '</div>';
+    renderGeneratedSampleSummary(
+        j,
+        method
+    );
 
 
     const repeatArea =
-        document
-            .getElementById(
-                "repeatArea"
-            );
+        document.getElementById(
+            "repeatArea"
+        );
 
 
-    if (repeatArea) {
+    if (
+        repeatArea
+    ) {
 
         repeatArea.style.display =
             "flex";
@@ -1118,10 +2731,11 @@ async function generateSample(
     renderResultsTable();
 
 
-    if (isRepeat) {
+    if (
+        isRepeat
+    ) {
 
         alert(
-
             "Selección reproducida correctamente.\n" +
 
             "Código de selección: " +
@@ -1132,23 +2746,105 @@ async function generateSample(
     } else {
 
         alert(
-
             "Muestra: " +
-
-            sj.rows +
-
+            j.rows +
             " registros"
         );
     }
 }
 
 
-// =========================================================
-// GENERAR NUEVA MUESTRA
-// =========================================================
+function renderGeneratedSampleSummary(
+    j,
+    method
+) {
+
+    const methodLabels = {
+        random:
+            "Aleatorio simple",
+        systematic:
+            "Sistemático",
+        stratified:
+            "Estratificado",
+        mus:
+            "MUS / PPS",
+        topn:
+            "Top N"
+    };
+
+
+    document
+        .getElementById(
+            "sampleSummary"
+        )
+        .innerHTML =
+
+            summaryItem(
+                "Tamaño",
+                j.rows || 0
+            ) +
+
+            summaryItem(
+                "Cobertura registros",
+                (
+                    j.coverage_count ||
+                    0
+                ).toFixed(2) +
+                "%"
+            ) +
+
+            summaryItem(
+                "Cobertura monetaria",
+                (
+                    j.coverage_amount ||
+                    0
+                ).toFixed(2) +
+                "%"
+            ) +
+
+            summaryItem(
+                "Código de selección",
+                j.seed,
+                "code-pill"
+            ) +
+
+            summaryItem(
+                "Método",
+                methodLabels[method] ||
+                method
+            );
+}
+
+
+function summaryItem(
+    label,
+    value,
+    extraClass = ""
+) {
+
+    return (
+
+        '<div class="summary-item ' +
+        extraClass +
+        '">' +
+
+            '<span class="summary-label">' +
+                label +
+            '</span>' +
+
+            '<span class="summary-value">' +
+                value +
+            '</span>' +
+
+        '</div>'
+    );
+}
+
 
 document
-    .getElementById("generate")
+    .getElementById(
+        "generate"
+    )
     .onclick =
         async () => {
 
@@ -1159,24 +2855,22 @@ document
         };
 
 
-// =========================================================
-// REPETIR SELECCIÓN
-// =========================================================
-
 const repeatSelectionButton =
-    document
-        .getElementById(
-            "repeatSelection"
-        );
+    document.getElementById(
+        "repeatSelection"
+    );
 
 
-if (repeatSelectionButton) {
+if (
+    repeatSelectionButton
+) {
 
     repeatSelectionButton.onclick =
         async () => {
 
-
-            if (!lastSelectionCode) {
+            if (
+                !lastSelectionCode
+            ) {
 
                 alert(
                     "Primero genere una muestra."
@@ -1200,25 +2894,47 @@ if (repeatSelectionButton) {
 
 function getVisibleSampleColumns() {
 
-    if (!sample.length) {
+    if (
+        !sample.length
+    ) {
 
         return [];
     }
 
 
     return Object
-        .keys(sample[0])
+        .keys(
+            sample[0]
+        )
         .filter(
-            c =>
-                !c.startsWith("_") &&
-                c !== "Tipo_Seleccion"
+            column =>
+
+                !column.startsWith(
+                    "_"
+                )
+
+                &&
+
+                column !==
+                    "Tipo_Seleccion"
         );
 }
 
 
 function renderSampleTable() {
 
-    if (!sample.length) {
+    const table =
+        document.getElementById(
+            "sampleTable"
+        );
+
+
+    if (
+        !sample.length
+    ) {
+
+        table.innerHTML =
+            "";
 
         return;
     }
@@ -1228,59 +2944,61 @@ function renderSampleTable() {
         getVisibleSampleColumns();
 
 
-    document
-        .getElementById("sampleTable")
-        .innerHTML =
+    table.innerHTML =
 
-            "<thead><tr>" +
+        "<thead><tr>" +
 
-                cols
-                    .map(
-                        c =>
-                            "<th>" +
-                            c +
-                            "</th>"
-                    )
-                    .join("") +
+        cols
+            .map(
+                column =>
+                    "<th>" +
+                    escapeHtml(column) +
+                    "</th>"
+            )
+            .join("") +
 
-            "</tr></thead>" +
+        "</tr></thead>" +
 
+        "<tbody>" +
 
-            "<tbody>" +
+        sample
+            .map(
+                row =>
 
-                sample
-                    .map(row =>
+                    "<tr>" +
 
-                        "<tr>" +
+                    cols
+                        .map(
+                            column =>
 
-                            cols
-                                .map(c =>
+                                "<td>" +
 
-                                    "<td>" +
-
+                                escapeHtml(
                                     displayValue(
-                                        row[c]
-                                    ) +
+                                        row[column]
+                                    )
+                                ) +
 
-                                    "</td>"
+                                "</td>"
+                        )
+                        .join("") +
 
-                                )
-                                .join("") +
+                    "</tr>"
+            )
+            .join("") +
 
-                        "</tr>"
-
-                    )
-                    .join("") +
-
-            "</tbody>";
+        "</tbody>";
 }
 
 
 // =========================================================
-// RESULTADOS DE AUDITORÍA
+// RESULTADOS
 // =========================================================
 
-function getOriginalIndex(row, fallbackIndex) {
+function getOriginalIndex(
+    row,
+    fallback
+) {
 
     if (
         row._original_index !== undefined &&
@@ -1292,11 +3010,13 @@ function getOriginalIndex(row, fallbackIndex) {
     }
 
 
-    return fallbackIndex;
+    return fallback;
 }
 
 
-function getRegisteredAmount(row) {
+function getRegisteredAmount(
+    row
+) {
 
     if (
         mapping.amount &&
@@ -1305,7 +3025,9 @@ function getRegisteredAmount(row) {
         row[mapping.amount] !== ""
     ) {
 
-        return row[mapping.amount];
+        return row[
+            mapping.amount
+        ];
     }
 
 
@@ -1315,11 +3037,18 @@ function getRegisteredAmount(row) {
 
 function renderResultsTable() {
 
-    if (!sample.length) {
+    const table =
+        document.getElementById(
+            "resultsTable"
+        );
 
-        document
-            .getElementById("resultsTable")
-            .innerHTML = "";
+
+    if (
+        !sample.length
+    ) {
+
+        table.innerHTML =
+            "";
 
         updateResultsDashboard();
 
@@ -1331,347 +3060,303 @@ function renderResultsTable() {
         getVisibleSampleColumns();
 
 
-    document
-        .getElementById(
-            "resultsTable"
-        )
-        .innerHTML =
+    table.innerHTML =
 
+        "<thead><tr>" +
 
-        "<thead>" +
+        cols
+            .map(
+                column =>
+                    "<th>" +
+                    escapeHtml(column) +
+                    "</th>"
+            )
+            .join("") +
 
-            "<tr>" +
+        '<th class="audit-col">Resultado de revisión</th>' +
 
+        '<th class="audit-col">Importe registrado</th>' +
 
-                cols
-                    .map(
-                        c =>
-                            "<th>" +
-                            c +
-                            "</th>"
-                    )
-                    .join("") +
+        '<th class="audit-col">Importe validado</th>' +
 
+        '<th class="audit-col">Diferencia</th>' +
 
-                '<th class="audit-col">' +
-                    'Resultado de revisión' +
-                '</th>' +
+        '<th class="audit-col">Tipo de excepción</th>' +
 
+        '<th class="audit-col">Comentario del auditor</th>' +
 
-                '<th class="audit-col">' +
-                    'Importe registrado' +
-                '</th>' +
+        '<th class="audit-col">Referencia de evidencia</th>' +
 
-
-                '<th class="audit-col">' +
-                    'Importe validado' +
-                '</th>' +
-
-
-                '<th class="audit-col">' +
-                    'Diferencia' +
-                '</th>' +
-
-
-                '<th class="audit-col">' +
-                    'Tipo de excepción' +
-                '</th>' +
-
-
-                '<th class="audit-col">' +
-                    'Comentario del auditor' +
-                '</th>' +
-
-
-                '<th class="audit-col">' +
-                    'Referencia de evidencia' +
-                '</th>' +
-
-
-            "</tr>" +
-
-        "</thead>" +
-
+        "</tr></thead>" +
 
         "<tbody>" +
 
+        sample
+            .map(
+                (
+                    row,
+                    i
+                ) => {
 
-            sample
-                .map(
-                    (row, i) => {
-
-
-                        const orig =
-                            getOriginalIndex(
-                                row,
-                                i
-                            );
-
-
-                        results[orig] =
-                            results[orig] || {};
+                    const orig =
+                        getOriginalIndex(
+                            row,
+                            i
+                        );
 
 
-                        const res =
-                            results[orig];
+                    const key =
+                        String(orig);
 
 
-                        const defaultRegistered =
-                            getRegisteredAmount(row);
+                    results[key] =
+                        results[key] ||
+                        {};
 
 
-                        const registeredValue =
-
-                            res.registered !== undefined &&
-                            res.registered !== ""
-
-                                ? res.registered
-
-                                : (
-                                    res.audited !== undefined &&
-                                    res.audited !== ""
-
-                                        ? res.audited
-
-                                        : defaultRegistered
-                                );
+                    const res =
+                        results[key];
 
 
-                        if (
-                            res.registered === undefined ||
-                            res.registered === ""
-                        ) {
-
-                            res.registered =
-                                registeredValue;
-                        }
+                    const defaultRegistered =
+                        getRegisteredAmount(
+                            row
+                        );
 
 
-                        const validatedValue =
+                    const registeredValue =
 
-                            res.validated !== undefined
+                        res.registered !== undefined &&
+                        res.registered !== ""
 
-                                ? res.validated
+                            ? res.registered
 
-                                : (
-                                    res.correct !== undefined
-
-                                        ? res.correct
-
-                                        : ""
-                                );
+                            : defaultRegistered;
 
 
-                        return "<tr>" +
+                    if (
+                        res.registered === undefined ||
+                        res.registered === ""
+                    ) {
+
+                        res.registered =
+                            registeredValue;
+                    }
 
 
-                            cols
-                                .map(
-                                    c =>
-                                        "<td>" +
+                    const validatedValue =
+
+                        res.validated !== undefined
+
+                            ? res.validated
+
+                            : "";
+
+
+                    return (
+
+                        "<tr>" +
+
+                        cols
+                            .map(
+                                column =>
+
+                                    "<td>" +
+
+                                    escapeHtml(
                                         displayValue(
-                                            row[c]
-                                        ) +
-                                        "</td>"
-                                )
-                                .join("") +
-
-
-                            '<td class="audit-col">' +
-
-                                '<select ' +
-                                    'class="res-status form-input" ' +
-                                    'data-idx="' +
-                                    orig +
-                                '">' +
-
-
-                                    optionSelected(
-                                        "",
-                                        "Pendiente",
-                                        res.status
+                                            row[column]
+                                        )
                                     ) +
 
-
-                                    optionSelected(
-                                        "Sin excepción",
-                                        "Sin excepción",
-                                        res.status
-                                    ) +
+                                    "</td>"
+                            )
+                            .join("") +
 
 
-                                    optionSelected(
-                                        "Excepción monetaria",
-                                        "Excepción monetaria",
-                                        res.status
-                                    ) +
+                        '<td class="audit-col">' +
 
-
-                                    optionSelected(
-                                        "Excepción no monetaria",
-                                        "Excepción no monetaria",
-                                        res.status
-                                    ) +
-
-
-                                '</select>' +
-
-                            '</td>' +
-
-
-                            '<td class="audit-col">' +
-
-                                '<input ' +
-                                    'class="res-registered form-input" ' +
-                                    'type="number" ' +
-                                    'step="any" ' +
-                                    'data-idx="' +
-                                    orig +
-                                    '" ' +
-                                    'value="' +
-                                    safeInputValue(
-                                        registeredValue
-                                    ) +
-                                '">' +
-
-                            '</td>' +
-
-
-                            '<td class="audit-col">' +
-
-                                '<input ' +
-                                    'class="res-validated form-input" ' +
-                                    'type="number" ' +
-                                    'step="any" ' +
-                                    'data-idx="' +
-                                    orig +
-                                    '" ' +
-                                    'value="' +
-                                    safeInputValue(
-                                        validatedValue
-                                    ) +
-                                '">' +
-
-                            '</td>' +
-
-
-                            '<td ' +
-                                'class="audit-col res-diff" ' +
+                            '<select ' +
+                                'class="res-status form-input" ' +
                                 'data-idx="' +
                                 orig +
                             '">' +
 
-                                formatDifference(
-                                    res.difference
+                                optionSelected(
+                                    "",
+                                    "Pendiente",
+                                    res.status
                                 ) +
 
-                            '</td>' +
+                                optionSelected(
+                                    "Sin excepción",
+                                    "Sin excepción",
+                                    res.status
+                                ) +
+
+                                optionSelected(
+                                    "Excepción monetaria",
+                                    "Excepción monetaria",
+                                    res.status
+                                ) +
+
+                                optionSelected(
+                                    "Excepción no monetaria",
+                                    "Excepción no monetaria",
+                                    res.status
+                                ) +
+
+                            '</select>' +
+
+                        '</td>' +
 
 
-                            '<td class="audit-col">' +
+                        '<td class="audit-col">' +
 
-                                '<select ' +
-                                    'class="res-exception-type form-input" ' +
-                                    'data-idx="' +
-                                    orig +
-                                '">' +
+                            '<input ' +
+                                'class="res-registered form-input" ' +
+                                'type="number" ' +
+                                'step="any" ' +
+                                'data-idx="' +
+                                orig +
+                                '" ' +
+                                'value="' +
+                                safeInputValue(
+                                    registeredValue
+                                ) +
+                            '">' +
 
-
-                                    optionSelected(
-                                        "",
-                                        "-",
-                                        res.exception_type
-                                    ) +
-
-
-                                    optionSelected(
-                                        "Monetaria",
-                                        "Monetaria",
-                                        res.exception_type
-                                    ) +
+                        '</td>' +
 
 
-                                    optionSelected(
-                                        "Documental",
-                                        "Documental",
-                                        res.exception_type
-                                    ) +
+                        '<td class="audit-col">' +
+
+                            '<input ' +
+                                'class="res-validated form-input" ' +
+                                'type="number" ' +
+                                'step="any" ' +
+                                'data-idx="' +
+                                orig +
+                                '" ' +
+                                'value="' +
+                                safeInputValue(
+                                    validatedValue
+                                ) +
+                            '">' +
+
+                        '</td>' +
 
 
-                                    optionSelected(
-                                        "Cumplimiento",
-                                        "Cumplimiento",
-                                        res.exception_type
-                                    ) +
+                        '<td ' +
+                            'class="audit-col res-diff" ' +
+                            'data-idx="' +
+                            orig +
+                        '">' +
+
+                            formatDifference(
+                                res.difference
+                            ) +
+
+                        '</td>' +
 
 
-                                    optionSelected(
-                                        "Duplicado",
-                                        "Duplicado",
-                                        res.exception_type
-                                    ) +
+                        '<td class="audit-col">' +
+
+                            '<select ' +
+                                'class="res-exception-type form-input" ' +
+                                'data-idx="' +
+                                orig +
+                            '">' +
+
+                                optionSelected(
+                                    "",
+                                    "-",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Monetaria",
+                                    "Monetaria",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Documental",
+                                    "Documental",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Cumplimiento",
+                                    "Cumplimiento",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Duplicado",
+                                    "Duplicado",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Imputación / registración",
+                                    "Imputación / registración",
+                                    res.exception_type
+                                ) +
+
+                                optionSelected(
+                                    "Otro",
+                                    "Otro",
+                                    res.exception_type
+                                ) +
+
+                            '</select>' +
+
+                        '</td>' +
 
 
-                                    optionSelected(
-                                        "Imputación / registración",
-                                        "Imputación / registración",
-                                        res.exception_type
-                                    ) +
+                        '<td class="audit-col">' +
+
+                            '<input ' +
+                                'class="res-comment form-input" ' +
+                                'type="text" ' +
+                                'data-idx="' +
+                                orig +
+                                '" ' +
+                                'placeholder="Describa brevemente la revisión" ' +
+                                'value="' +
+                                escapeAttribute(
+                                    res.comment ||
+                                    ""
+                                ) +
+                            '">' +
+
+                        '</td>' +
 
 
-                                    optionSelected(
-                                        "Otro",
-                                        "Otro",
-                                        res.exception_type
-                                    ) +
+                        '<td class="audit-col">' +
 
+                            '<input ' +
+                                'class="res-evidence form-input" ' +
+                                'type="text" ' +
+                                'data-idx="' +
+                                orig +
+                                '" ' +
+                                'placeholder="Factura, OC, SAP, ticket..." ' +
+                                'value="' +
+                                escapeAttribute(
+                                    res.evidence ||
+                                    ""
+                                ) +
+                            '">' +
 
-                                '</select>' +
+                        '</td>' +
 
-                            '</td>' +
-
-
-                            '<td class="audit-col">' +
-
-                                '<input ' +
-                                    'class="res-comment form-input" ' +
-                                    'type="text" ' +
-                                    'data-idx="' +
-                                    orig +
-                                    '" ' +
-                                    'placeholder="Describa brevemente la revisión" ' +
-                                    'value="' +
-                                    escapeAttribute(
-                                        res.comment || ""
-                                    ) +
-                                '">' +
-
-                            '</td>' +
-
-
-                            '<td class="audit-col">' +
-
-                                '<input ' +
-                                    'class="res-evidence form-input" ' +
-                                    'type="text" ' +
-                                    'data-idx="' +
-                                    orig +
-                                    '" ' +
-                                    'placeholder="Factura, OC, SAP, ticket..." ' +
-                                    'value="' +
-                                    escapeAttribute(
-                                        res.evidence || ""
-                                    ) +
-                                '">' +
-
-                            '</td>' +
-
-
-                        "</tr>";
-                    }
-                )
-                .join("") +
-
+                        "</tr>"
+                    );
+                }
+            )
+            .join("") +
 
         "</tbody>";
 
@@ -1683,20 +3368,19 @@ function renderResultsTable() {
 
 
 // =========================================================
-// EVENTOS DE RESULTADOS
+// EVENTOS RESULTADOS
 // =========================================================
 
 function bindResultEvents() {
-
 
     document
         .querySelectorAll(
             ".res-registered, .res-validated"
         )
         .forEach(
-            inp => {
+            input => {
 
-                inp.oninput =
+                input.oninput =
                     calcDiff;
             }
         );
@@ -1707,9 +3391,9 @@ function bindResultEvents() {
             ".res-status"
         )
         .forEach(
-            sel => {
+            select => {
 
-                sel.onchange =
+                select.onchange =
                     handleStatusChange;
             }
         );
@@ -1720,22 +3404,24 @@ function bindResultEvents() {
             ".res-exception-type"
         )
         .forEach(
-            sel => {
+            select => {
 
-                sel.onchange =
+                select.onchange =
                     () => {
 
                         const idx =
-                            sel.dataset.idx;
+                            String(
+                                select.dataset.idx
+                            );
 
 
                         results[idx] =
-                            results[idx] || {};
+                            results[idx] ||
+                            {};
 
 
-                        results[idx]
-                            .exception_type =
-                                sel.value;
+                        results[idx].exception_type =
+                            select.value;
 
 
                         updateResultsDashboard();
@@ -1749,21 +3435,24 @@ function bindResultEvents() {
             ".res-comment"
         )
         .forEach(
-            inp => {
+            input => {
 
-                inp.oninput =
+                input.oninput =
                     () => {
 
                         const idx =
-                            inp.dataset.idx;
+                            String(
+                                input.dataset.idx
+                            );
 
 
                         results[idx] =
-                            results[idx] || {};
+                            results[idx] ||
+                            {};
 
 
                         results[idx].comment =
-                            inp.value;
+                            input.value;
                     };
             }
         );
@@ -1774,21 +3463,24 @@ function bindResultEvents() {
             ".res-evidence"
         )
         .forEach(
-            inp => {
+            input => {
 
-                inp.oninput =
+                input.oninput =
                     () => {
 
                         const idx =
-                            inp.dataset.idx;
+                            String(
+                                input.dataset.idx
+                            );
 
 
                         results[idx] =
-                            results[idx] || {};
+                            results[idx] ||
+                            {};
 
 
                         results[idx].evidence =
-                            inp.value;
+                            input.value;
                     };
             }
         );
@@ -1796,29 +3488,32 @@ function bindResultEvents() {
 
 
 // =========================================================
-// CAMBIO DE ESTADO
+// ESTADO DE REVISIÓN
 // =========================================================
 
 function handleStatusChange(e) {
 
-    const sel =
+    const select =
         e.target;
 
 
     const idx =
-        sel.dataset.idx;
+        String(
+            select.dataset.idx
+        );
 
 
     results[idx] =
-        results[idx] || {};
+        results[idx] ||
+        {};
 
 
     results[idx].status =
-        sel.value;
+        select.value;
 
 
     if (
-        sel.value ===
+        select.value ===
         "Sin excepción"
     ) {
 
@@ -1864,12 +3559,23 @@ function handleStatusChange(e) {
                 0;
 
 
-            document.querySelector(
-                '.res-diff[data-idx="' +
-                idx +
-                '"]'
-            ).textContent =
-                formatDifference(0);
+            const diffCell =
+                document.querySelector(
+                    '.res-diff[data-idx="' +
+                    idx +
+                    '"]'
+                );
+
+
+            if (
+                diffCell
+            ) {
+
+                diffCell.textContent =
+                    formatDifference(
+                        0
+                    );
+            }
         }
     }
 
@@ -1879,13 +3585,15 @@ function handleStatusChange(e) {
 
 
 // =========================================================
-// DIFERENCIA MONETARIA
+// DIFERENCIA
 // =========================================================
 
 function calcDiff(e) {
 
     const idx =
-        e.target.dataset.idx;
+        String(
+            e.target.dataset.idx
+        );
 
 
     const registeredInput =
@@ -1926,7 +3634,8 @@ function calcDiff(e) {
 
 
     results[idx] =
-        results[idx] || {};
+        results[idx] ||
+        {};
 
 
     results[idx].registered =
@@ -1935,6 +3644,14 @@ function calcDiff(e) {
 
     results[idx].validated =
         validated;
+
+
+    const diffCell =
+        document.querySelector(
+            '.res-diff[data-idx="' +
+            idx +
+            '"]'
+        );
 
 
     if (
@@ -1946,12 +3663,13 @@ function calcDiff(e) {
             "";
 
 
-        document.querySelector(
-            '.res-diff[data-idx="' +
-            idx +
-            '"]'
-        ).textContent =
-            "";
+        if (
+            diffCell
+        ) {
+
+            diffCell.textContent =
+                "";
+        }
 
 
         updateResultsDashboard();
@@ -1960,21 +3678,32 @@ function calcDiff(e) {
     }
 
 
-    const diff =
-        Number(registered) -
-        Number(validated);
+    const difference =
+
+        Number(
+            registered
+        )
+
+        -
+
+        Number(
+            validated
+        );
 
 
     results[idx].difference =
-        diff;
+        difference;
 
 
-    document.querySelector(
-        '.res-diff[data-idx="' +
-        idx +
-        '"]'
-    ).textContent =
-        formatDifference(diff);
+    if (
+        diffCell
+    ) {
+
+        diffCell.textContent =
+            formatDifference(
+                difference
+            );
+    }
 
 
     updateResultsDashboard();
@@ -1982,7 +3711,7 @@ function calcDiff(e) {
 
 
 // =========================================================
-// DASHBOARD DE RESULTADOS
+// DASHBOARD RESULTADOS
 // =========================================================
 
 function updateResultsDashboard() {
@@ -1993,13 +3722,17 @@ function updateResultsDashboard() {
         );
 
 
-    if (!dash) {
+    if (
+        !dash
+    ) {
 
         return;
     }
 
 
-    if (!sample.length) {
+    if (
+        !sample.length
+    ) {
 
         dash.innerHTML =
             "";
@@ -2009,26 +3742,29 @@ function updateResultsDashboard() {
 
 
     let reviewed = 0;
-
     let exceptions = 0;
-
     let pending = 0;
-
     let observedError = 0;
 
 
     sample.forEach(
-        (row, i) => {
+        (
+            row,
+            i
+        ) => {
 
             const idx =
-                getOriginalIndex(
-                    row,
-                    i
+                String(
+                    getOriginalIndex(
+                        row,
+                        i
+                    )
                 );
 
 
             const res =
-                results[idx] || {};
+                results[idx] ||
+                {};
 
 
             if (
@@ -2046,7 +3782,9 @@ function updateResultsDashboard() {
 
             if (
                 res.status ===
-                    "Excepción monetaria" ||
+                    "Excepción monetaria"
+
+                ||
 
                 res.status ===
                     "Excepción no monetaria"
@@ -2063,6 +3801,7 @@ function updateResultsDashboard() {
             ) {
 
                 observedError +=
+
                     Math.abs(
                         Number(
                             res.difference
@@ -2075,72 +3814,32 @@ function updateResultsDashboard() {
 
     dash.innerHTML =
 
+        kpiCard(
+            "Total muestra",
+            sample.length
+        ) +
 
-        '<div class="kpi-card">' +
+        kpiCard(
+            "Revisados",
+            reviewed
+        ) +
 
-            '<div class="kpi-label">' +
-                'Total muestra' +
-            '</div>' +
+        kpiCard(
+            "Pendientes",
+            pending
+        ) +
 
-            '<div class="kpi-value">' +
-                sample.length +
-            '</div>' +
+        kpiCard(
+            "Excepciones",
+            exceptions
+        ) +
 
-        '</div>' +
-
-
-        '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Revisados' +
-            '</div>' +
-
-            '<div class="kpi-value">' +
-                reviewed +
-            '</div>' +
-
-        '</div>' +
-
-
-        '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Pendientes' +
-            '</div>' +
-
-            '<div class="kpi-value">' +
-                pending +
-            '</div>' +
-
-        '</div>' +
-
-
-        '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Excepciones' +
-            '</div>' +
-
-            '<div class="kpi-value">' +
-                exceptions +
-            '</div>' +
-
-        '</div>' +
-
-
-        '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                'Error monetario observado' +
-            '</div>' +
-
-            '<div class="kpi-value">' +
-                formatMoney(
-                    observedError
-                ) +
-            '</div>' +
-
-        '</div>';
+        kpiCard(
+            "Error monetario observado",
+            formatMoney(
+                observedError
+            )
+        );
 }
 
 
@@ -2149,15 +3848,18 @@ function updateResultsDashboard() {
 // =========================================================
 
 document
-    .getElementById("saveResults")
+    .getElementById(
+        "saveResults"
+    )
     .onclick =
         async () => {
 
-
-            if (!sample.length) {
+            if (
+                !sample.length
+            ) {
 
                 alert(
-                    "Genere muestra primero"
+                    "Genere muestra primero."
                 );
 
                 return;
@@ -2170,18 +3872,23 @@ document
             const payloadResults =
 
                 sample.map(
-                    (row, i) => {
-
+                    (
+                        row,
+                        i
+                    ) => {
 
                         const idx =
-                            getOriginalIndex(
-                                row,
-                                i
+                            String(
+                                getOriginalIndex(
+                                    row,
+                                    i
+                                )
                             );
 
 
                         const res =
-                            results[idx] || {};
+                            results[idx] ||
+                            {};
 
 
                         return {
@@ -2190,41 +3897,58 @@ document
                                 Number(idx),
 
                             status:
-                                res.status || "",
+                                res.status ||
+                                "",
 
                             registered:
+
                                 res.registered !== undefined
+
                                     ? res.registered
+
                                     : "",
 
                             validated:
+
                                 res.validated !== undefined
+
                                     ? res.validated
+
                                     : "",
 
                             audited:
+
                                 res.registered !== undefined
+
                                     ? res.registered
+
                                     : "",
 
                             correct:
+
                                 res.validated !== undefined
+
                                     ? res.validated
+
                                     : "",
 
                             difference:
+
                                 Number(
                                     res.difference
                                 ) || 0,
 
                             exception_type:
-                                res.exception_type || "",
+                                res.exception_type ||
+                                "",
 
                             comment:
-                                res.comment || "",
+                                res.comment ||
+                                "",
 
                             evidence:
-                                res.evidence || ""
+                                res.evidence ||
+                                ""
                         };
                     }
                 );
@@ -2234,17 +3958,16 @@ document
                 await fetch(
                     "/api/results",
                     {
-                        method: "POST",
+                        method:
+                            "POST",
 
                         headers: {
-
                             "Content-Type":
                                 "application/json"
                         },
 
                         body:
                             JSON.stringify({
-
                                 results:
                                     payloadResults
                             })
@@ -2256,30 +3979,45 @@ document
                 await r.json();
 
 
-            if (!r.ok || j.error) {
+            if (
+                !r.ok ||
+                j.error
+            ) {
 
-                alert(
-                    j.error ||
-                    "No se pudieron guardar los resultados"
-                );
+                if (
+                    j.conflict
+                ) {
+
+                    alert(
+                        j.error +
+                        "\n\nVolvé a abrir el trabajo antes de continuar."
+                    );
+
+                } else {
+
+                    alert(
+                        j.error ||
+                        "No se pudieron guardar los resultados."
+                    );
+                }
 
                 return;
             }
 
 
             alert(
-                "Resultados guardados"
+                "Resultados guardados."
             );
 
 
             updateResultsDashboard();
 
-            updateExtrapolation();
+            await updateExtrapolation();
         };
 
 
 // =========================================================
-// RECOLECTAR CAMPOS VISIBLES
+// RECOLECTAR RESULTADOS
 // =========================================================
 
 function collectVisibleResults() {
@@ -2292,11 +4030,14 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
                 results[idx].status =
@@ -2313,11 +4054,14 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
                 results[idx].registered =
@@ -2336,11 +4080,14 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
                 results[idx].validated =
@@ -2359,16 +4106,18 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
-                results[idx]
-                    .exception_type =
-                        el.value;
+                results[idx].exception_type =
+                    el.value;
             }
         );
 
@@ -2381,11 +4130,14 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
                 results[idx].comment =
@@ -2402,11 +4154,14 @@ function collectVisibleResults() {
             el => {
 
                 const idx =
-                    el.dataset.idx;
+                    String(
+                        el.dataset.idx
+                    );
 
 
                 results[idx] =
-                    results[idx] || {};
+                    results[idx] ||
+                    {};
 
 
                 results[idx].evidence =
@@ -2426,13 +4181,16 @@ const downloadReview =
     );
 
 
-if (downloadReview) {
+if (
+    downloadReview
+) {
 
     downloadReview.onclick =
         () => {
 
-
-            if (!sample.length) {
+            if (
+                !sample.length
+            ) {
 
                 alert(
                     "Genere primero una muestra."
@@ -2449,7 +4207,7 @@ if (downloadReview) {
 
 
 // =========================================================
-// IMPORTAR RESULTADOS DESDE EXCEL
+// IMPORTAR EXCEL DE REVISIÓN
 // =========================================================
 
 const importReview =
@@ -2472,8 +4230,9 @@ if (
     importReview.onclick =
         () => {
 
-
-            if (!sample.length) {
+            if (
+                !sample.length
+            ) {
 
                 alert(
                     "Genere primero una muestra."
@@ -2490,12 +4249,13 @@ if (
     reviewFile.onchange =
         async e => {
 
-
             const f =
                 e.target.files[0];
 
 
-            if (!f) {
+            if (
+                !f
+            ) {
 
                 return;
             }
@@ -2517,8 +4277,11 @@ if (
                     await fetch(
                         "/api/import-results",
                         {
-                            method: "POST",
-                            body: fd
+                            method:
+                                "POST",
+
+                            body:
+                                fd
                         }
                     );
 
@@ -2532,10 +4295,22 @@ if (
                     j.error
                 ) {
 
-                    alert(
-                        j.error ||
-                        "No se pudo importar el archivo"
-                    );
+                    if (
+                        j.conflict
+                    ) {
+
+                        alert(
+                            j.error +
+                            "\n\nVolvé a abrir el trabajo antes de continuar."
+                        );
+
+                    } else {
+
+                        alert(
+                            j.error ||
+                            "No se pudo importar el archivo."
+                        );
+                    }
 
                     return;
                 }
@@ -2550,7 +4325,6 @@ if (
                     j.results.forEach(
                         item => {
 
-
                             const idx =
                                 String(
                                     item._original_index
@@ -2560,31 +4334,44 @@ if (
                             results[idx] = {
 
                                 status:
-                                    item.status || "",
+                                    item.status ||
+                                    "",
 
                                 registered:
+
                                     item.registered !== undefined
+
                                         ? item.registered
+
                                         : "",
 
                                 validated:
+
                                     item.validated !== undefined
+
                                         ? item.validated
+
                                         : "",
 
                                 difference:
+
                                     item.difference !== undefined
+
                                         ? item.difference
+
                                         : "",
 
                                 exception_type:
-                                    item.exception_type || "",
+                                    item.exception_type ||
+                                    "",
 
                                 comment:
-                                    item.comment || "",
+                                    item.comment ||
+                                    "",
 
                                 evidence:
-                                    item.evidence || ""
+                                    item.evidence ||
+                                    ""
                             };
                         }
                     );
@@ -2620,15 +4407,18 @@ if (
                 }
 
 
-                alert(message);
+                alert(
+                    message
+                );
+
+
+                await updateExtrapolation();
 
 
             } catch (err) {
 
                 alert(
-
                     "Error al importar: " +
-
                     err.message
                 );
             }
@@ -2645,7 +4435,9 @@ if (
 // =========================================================
 
 document
-    .getElementById("refreshExtra")
+    .getElementById(
+        "refreshExtra"
+    )
     .onclick =
         updateExtrapolation;
 
@@ -2662,7 +4454,10 @@ async function updateExtrapolation() {
         await r.json();
 
 
-    if (j.error) {
+    if (
+        !r.ok ||
+        j.error
+    ) {
 
         document
             .getElementById(
@@ -2672,7 +4467,10 @@ async function updateExtrapolation() {
 
                 '<div class="warning-box">' +
 
-                    j.error +
+                escapeHtml(
+                    j.error ||
+                    "No se pudo calcular la extrapolación."
+                ) +
 
                 '</div>';
 
@@ -2692,7 +4490,9 @@ async function updateExtrapolation() {
                 ? (
                     '<div class="warning-box">' +
 
-                        j.message +
+                    escapeHtml(
+                        j.message
+                    ) +
 
                     '</div>'
                 )
@@ -2706,59 +4506,29 @@ async function updateExtrapolation() {
         )
         .innerHTML =
 
+            observedItem(
+                "Error detectado en revisión 100%",
+                formatMoney(
+                    j.observed_100 ||
+                    0
+                )
+            ) +
 
-            '<div class="obs-item">' +
+            observedItem(
+                "Error detectado en muestra probabilística",
+                formatMoney(
+                    j.observed_residual ||
+                    0
+                )
+            ) +
 
-                '<span class="obs-label">' +
-                    'Error detectado en revisión 100%' +
-                '</span>' +
-
-                '<span class="obs-value">' +
-
-                    formatMoney(
-                        j.observed_100 ||
-                        0
-                    ) +
-
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="obs-item">' +
-
-                '<span class="obs-label">' +
-                    'Error detectado en muestra probabilística' +
-                '</span>' +
-
-                '<span class="obs-value">' +
-
-                    formatMoney(
-                        j.observed_residual ||
-                        0
-                    ) +
-
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="obs-item">' +
-
-                '<span class="obs-label">' +
-                    'Total de errores efectivamente detectados' +
-                '</span>' +
-
-                '<span class="obs-value">' +
-
-                    formatMoney(
-                        j.effectively_identified ||
-                        0
-                    ) +
-
-                '</span>' +
-
-            '</div>';
+            observedItem(
+                "Total de errores efectivamente detectados",
+                formatMoney(
+                    j.effectively_identified ||
+                    0
+                )
+            );
 
 
     document
@@ -2767,65 +4537,42 @@ async function updateExtrapolation() {
         )
         .innerHTML =
 
+            projectedItem(
+                "Tasa de error observada",
 
-            '<div class="proj-item">' +
-
-                '<span class="proj-label">' +
-                    'Tasa de error observada' +
-                '</span>' +
-
-                '<span class="proj-value">' +
-
+                (
                     (
-                        (
-                            j.error_rate ||
-                            0
-                        ) *
-                        100
+                        j.error_rate ||
+                        0
                     )
-                    .toFixed(2) +
 
-                    '%' +
+                    *
 
-                '</span>' +
+                    100
+                ).toFixed(2)
 
-            '</div>' +
+                +
 
+                "%"
+            ) +
 
-            '<div class="proj-item">' +
+            projectedItem(
+                "Error estimado en el universo probabilístico",
 
-                '<span class="proj-label">' +
-                    'Error estimado en el universo probabilístico' +
-                '</span>' +
+                formatMoney(
+                    j.projected_residual ||
+                    0
+                )
+            ) +
 
-                '<span class="proj-value">' +
+            projectedItem(
+                "Error total estimado de la población",
 
-                    formatMoney(
-                        j.projected_residual ||
-                        0
-                    ) +
-
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="proj-item">' +
-
-                '<span class="proj-label">' +
-                    'Error total estimado de la población' +
-                '</span>' +
-
-                '<span class="proj-value">' +
-
-                    formatMoney(
-                        j.total_estimated ||
-                        0
-                    ) +
-
-                '</span>' +
-
-            '</div>';
+                formatMoney(
+                    j.total_estimated ||
+                    0
+                )
+            );
 
 
     document
@@ -2834,129 +4581,67 @@ async function updateExtrapolation() {
         )
         .innerHTML =
 
+            executiveKpi(
+                "Muestra",
+                (
+                    j.sample_count ||
+                    0
+                ).toLocaleString()
+            ) +
 
-            '<div class="exec-kpi">' +
+            executiveKpi(
+                "Cobertura registros",
+                (
+                    j.coverage_count ||
+                    0
+                ).toFixed(2) +
+                "%"
+            ) +
 
-                '<div class="exec-kpi-label">' +
-                    'Muestra' +
-                '</div>' +
+            executiveKpi(
+                "Excepciones",
+                j.exceptions ||
+                0
+            ) +
 
-                '<div class="exec-kpi-value">' +
+            executiveKpi(
+                "Error observado",
+
+                formatMoney(
+                    (
+                        j.observed_100 ||
+                        0
+                    )
+
+                    +
 
                     (
-                        j.sample_count ||
+                        j.observed_residual ||
                         0
-                    ).toLocaleString() +
+                    )
+                )
+            ) +
 
-                '</div>' +
+            executiveKpi(
+                "Error estimado universo probabilístico",
 
-            '</div>' +
+                formatMoney(
+                    j.projected_residual ||
+                    0
+                )
+            ) +
 
+            executiveKpi(
+                "Error total estimado",
 
-            '<div class="exec-kpi">' +
-
-                '<div class="exec-kpi-label">' +
-                    'Cobertura registros' +
-                '</div>' +
-
-                '<div class="exec-kpi-value">' +
-
-                    (
-                        j.coverage_count ||
-                        0
-                    ).toFixed(2) +
-
-                    '%' +
-
-                '</div>' +
-
-            '</div>' +
+                formatMoney(
+                    j.total_estimated ||
+                    0
+                )
+            );
 
 
-            '<div class="exec-kpi">' +
-
-                '<div class="exec-kpi-label">' +
-                    'Excepciones' +
-                '</div>' +
-
-                '<div class="exec-kpi-value">' +
-
-                    (
-                        j.exceptions ||
-                        0
-                    ) +
-
-                '</div>' +
-
-            '</div>' +
-
-
-            '<div class="exec-kpi">' +
-
-                '<div class="exec-kpi-label">' +
-                    'Error observado' +
-                '</div>' +
-
-                '<div class="exec-kpi-value">' +
-
-                    formatMoney(
-
-                        (
-                            j.observed_100 ||
-                            0
-                        )
-
-                        +
-
-                        (
-                            j.observed_residual ||
-                            0
-                        )
-
-                    ) +
-
-                '</div>' +
-
-            '</div>' +
-
-
-            '<div class="exec-kpi">' +
-
-                '<div class="exec-kpi-label">' +
-                    'Error proyectado' +
-                '</div>' +
-
-                '<div class="exec-kpi-value">' +
-
-                    formatMoney(
-                        j.projected_residual ||
-                        0
-                    ) +
-
-                '</div>' +
-
-            '</div>' +
-
-
-            '<div class="exec-kpi">' +
-
-                '<div class="exec-kpi-label">' +
-                    'Error total' +
-                '</div>' +
-
-                '<div class="exec-kpi-value">' +
-
-                    formatMoney(
-                        j.total_estimated ||
-                        0
-                    ) +
-
-                '</div>' +
-
-            '</div>';
-
-
-    const mat =
+    const materiality =
         j.materiality ||
         0;
 
@@ -2972,42 +4657,107 @@ async function updateExtrapolation() {
         )
         .innerHTML =
 
-
             '<p>' +
 
-                'Error total estimado: ' +
+            'Error total estimado de la población: ' +
 
-                '<strong>' +
+            '<strong>' +
 
-                    formatMoney(
-                        j.total_estimated ||
-                        0
-                    ) +
+            formatMoney(
+                j.total_estimated ||
+                0
+            ) +
 
-                '</strong>' +
+            '</strong>. ' +
 
-                '. Materialidad: ' +
+            'Materialidad: ' +
 
-                '<strong>' +
+            '<strong>' +
 
-                    formatMoney(mat) +
+            formatMoney(
+                materiality
+            ) +
 
-                '</strong>' +
+            '</strong>. ' +
 
-                '. Estado: ' +
+            'Estado: ' +
 
-                '<strong>' +
+            '<strong>' +
 
-                    (
-                        checks
-                            .total_vs_materiality ||
+            escapeHtml(
+                checks.total_vs_materiality ||
+                "sin umbral"
+            ) +
 
-                        "sin umbral"
-                    ) +
-
-                '</strong>.' +
+            '</strong>.' +
 
             '</p>';
+}
+
+
+function observedItem(
+    label,
+    value
+) {
+
+    return (
+
+        '<div class="obs-item">' +
+
+            '<span class="obs-label">' +
+                label +
+            '</span>' +
+
+            '<span class="obs-value">' +
+                value +
+            '</span>' +
+
+        '</div>'
+    );
+}
+
+
+function projectedItem(
+    label,
+    value
+) {
+
+    return (
+
+        '<div class="proj-item">' +
+
+            '<span class="proj-label">' +
+                label +
+            '</span>' +
+
+            '<span class="proj-value">' +
+                value +
+            '</span>' +
+
+        '</div>'
+    );
+}
+
+
+function executiveKpi(
+    label,
+    value
+) {
+
+    return (
+
+        '<div class="exec-kpi">' +
+
+            '<div class="exec-kpi-label">' +
+                label +
+            '</div>' +
+
+            '<div class="exec-kpi-value">' +
+                value +
+            '</div>' +
+
+        '</div>'
+    );
 }
 
 
@@ -3022,26 +4772,35 @@ function optionSelected(
 ) {
 
     return (
+
         '<option value="' +
-        escapeAttribute(value) +
+        escapeAttribute(
+            value
+        ) +
         '"' +
 
         (
             value === selectedValue
+
                 ? " selected"
+
                 : ""
         ) +
 
         '>' +
 
-        label +
+        escapeHtml(
+            label
+        ) +
 
         '</option>'
     );
 }
 
 
-function parseNumberOrBlank(value) {
+function parseNumberOrBlank(
+    value
+) {
 
     if (
         value === "" ||
@@ -3054,10 +4813,14 @@ function parseNumberOrBlank(value) {
 
 
     const number =
-        Number(value);
+        Number(
+            value
+        );
 
 
-    return Number.isFinite(number)
+    return Number.isFinite(
+        number
+    )
 
         ? number
 
@@ -3065,7 +4828,9 @@ function parseNumberOrBlank(value) {
 }
 
 
-function formatDifference(value) {
+function formatDifference(
+    value
+) {
 
     if (
         value === "" ||
@@ -3077,30 +4842,39 @@ function formatDifference(value) {
     }
 
 
-    return formatMoney(value);
+    return formatMoney(
+        value
+    );
 }
 
 
-function safeInputValue(value) {
+function safeInputValue(
+    value
+) {
 
     if (
         value === null ||
-        value === undefined
+        value === undefined ||
+        value === ""
     ) {
 
         return "";
     }
 
 
-    const n =
-        Number(value);
+    const number =
+        Number(
+            value
+        );
 
 
     if (
-        Number.isFinite(n)
+        Number.isFinite(
+            number
+        )
     ) {
 
-        return n;
+        return number;
     }
 
 
@@ -3108,7 +4882,9 @@ function safeInputValue(value) {
 }
 
 
-function displayValue(value) {
+function displayValue(
+    value
+) {
 
     if (
         value === null ||
@@ -3119,11 +4895,15 @@ function displayValue(value) {
     }
 
 
-    return value;
+    return String(
+        value
+    );
 }
 
 
-function escapeAttribute(value) {
+function escapeHtml(
+    value
+) {
 
     return String(
         value === undefined ||
@@ -3136,16 +4916,30 @@ function escapeAttribute(value) {
         "&amp;"
     )
     .replaceAll(
-        '"',
-        "&quot;"
-    )
-    .replaceAll(
         "<",
         "&lt;"
     )
     .replaceAll(
         ">",
         "&gt;"
+    )
+    .replaceAll(
+        '"',
+        "&quot;"
+    )
+    .replaceAll(
+        "'",
+        "&#039;"
+    );
+}
+
+
+function escapeAttribute(
+    value
+) {
+
+    return escapeHtml(
+        value
     );
 }
 
@@ -3154,11 +4948,14 @@ function escapeAttribute(value) {
 // FORMATO MONETARIO
 // =========================================================
 
-function formatMoney(value) {
+function formatMoney(
+    value
+) {
 
     const number =
-        Number(value) ||
-        0;
+        Number(
+            value
+        ) || 0;
 
 
     return new Intl.NumberFormat(
@@ -3177,5 +4974,14 @@ function formatMoney(value) {
                 2
         }
     )
-    .format(number);
+    .format(
+        number
+    );
 }
+
+
+// =========================================================
+// INICIAR TRACKING
+// =========================================================
+
+initializeWorkTracking();
