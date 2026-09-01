@@ -45,12 +45,8 @@ def df_to_blob(df):
         return None
 
     buffer = BytesIO()
-
-    # Identificador del nuevo formato
     buffer.write(b'PKL1')
 
-    # Serializa y comprime directamente para evitar
-    # crear un JSON gigante en memoria.
     with gzip.GzipFile(
         fileobj=buffer,
         mode='wb',
@@ -62,9 +58,7 @@ def df_to_blob(df):
             protocol=pickle.HIGHEST_PROTOCOL
         )
 
-    return psycopg2.Binary(
-        buffer.getvalue()
-    )
+    return psycopg2.Binary(buffer.getvalue())
 
 
 def blob_to_df(blob):
@@ -76,7 +70,6 @@ def blob_to_df(blob):
     if not raw:
         return pd.DataFrame()
 
-    # Nuevo formato: Pickle + Gzip
     if raw.startswith(b'PKL1'):
         buffer = BytesIO(raw)
         buffer.seek(4)
@@ -87,8 +80,6 @@ def blob_to_df(blob):
         ) as gz:
             return pickle.load(gz)
 
-    # Compatibilidad con trabajos anteriores
-    # guardados como JSON + Gzip.
     text = gzip.decompress(raw).decode('utf-8')
 
     return pd.read_json(
@@ -620,25 +611,25 @@ def upload():
     f.save(path)
     try:
         ext = name.rsplit('.', 1)[1].lower()
-       if ext == 'csv':
-    try:
-        df = pd.read_csv(
-            path,
-            sep=';',
-            low_memory=False
-        )
-    except UnicodeDecodeError:
-        df = pd.read_csv(
-            path,
-            sep=';',
-            low_memory=False,
-            encoding='latin1'
-        )
-else:
-    df = pd.read_excel(
-        path,
-        engine='pyxlsb' if ext == 'xlsb' else None
-    )
+        if ext == 'csv':
+            try:
+                df = pd.read_csv(
+                    path,
+                    sep=';',
+                    low_memory=False
+                )
+            except UnicodeDecodeError:
+                df = pd.read_csv(
+                    path,
+                    sep=';',
+                    low_memory=False,
+                    encoding='latin1'
+                )
+        else:
+            df = pd.read_excel(
+                path,
+                engine='pyxlsb' if ext == 'xlsb' else None
+            )
     except Exception as e:
         return (jsonify(error='No se pudo leer el archivo: ' + str(e)), 400)
     df.columns = [str(c).strip() for c in df.columns]
