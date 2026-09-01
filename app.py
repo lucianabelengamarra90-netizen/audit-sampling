@@ -1,4 +1,4 @@
-import os, uuid, math, hashlib, json, gzip, secrets, pickle
+import os, uuid, math, hashlib, json, gzip, secrets, pickle, csv
 from datetime import datetime
 from io import BytesIO, StringIO
 import numpy as np
@@ -87,17 +87,71 @@ def blob_to_df(blob):
         orient='split'
     )
 
+
 def init_db():
     if not database_available():
         print('DATABASE_URL no configurada: tracking persistente deshabilitado.')
         return
+
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute('\n                CREATE SEQUENCE IF NOT EXISTS audit_work_seq START 1;\n            ')
-            cur.execute("\n                CREATE TABLE IF NOT EXISTS audit_projects (\n                    work_code VARCHAR(40) PRIMARY KEY,\n                    name TEXT NOT NULL,\n                    responsible TEXT NOT NULL,\n                    access_key_hash TEXT NOT NULL,\n                    status TEXT NOT NULL DEFAULT 'En curso',\n                    source_name TEXT,\n                    source_hash TEXT,\n                    mapping JSONB NOT NULL DEFAULT '{}'::jsonb,\n                    params JSONB NOT NULL DEFAULT '{}'::jsonb,\n                    audit_results JSONB NOT NULL DEFAULT '{}'::jsonb,\n                    population_blob BYTEA,\n                    sample_blob BYTEA,\n                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n                    version INTEGER NOT NULL DEFAULT 1\n                );\n            ")
-            cur.execute("\n                CREATE TABLE IF NOT EXISTS audit_project_events (\n                    id BIGSERIAL PRIMARY KEY,\n                    work_code VARCHAR(40) NOT NULL\n                        REFERENCES audit_projects(work_code)\n                        ON DELETE CASCADE,\n                    event_type TEXT NOT NULL,\n                    actor TEXT,\n                    details JSONB NOT NULL DEFAULT '{}'::jsonb,\n                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n                );\n            ")
-            cur.execute('\n                CREATE INDEX IF NOT EXISTS idx_audit_projects_updated\n                ON audit_projects(updated_at DESC);\n            ')
-            cur.execute('\n                CREATE INDEX IF NOT EXISTS idx_audit_events_work\n                ON audit_project_events(work_code, created_at DESC);\n            ')
+            cur.execute("""
+                CREATE SEQUENCE IF NOT EXISTS audit_work_seq START 1;
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_projects (
+                    work_code VARCHAR(40) PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    responsible TEXT NOT NULL,
+                    access_key_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'En curso',
+                    source_name TEXT,
+                    source_hash TEXT,
+                    mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    params JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    audit_results JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    population_blob BYTEA,
+                    sample_blob BYTEA,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+            """)
+
+            # Metadatos adicionales para poblaciones grandes procesadas en modo streaming.
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_rows BIGINT DEFAULT 0;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_columns JSONB NOT NULL DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_preview JSONB NOT NULL DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_ext TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_encoding TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_separator TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_streaming BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS analysis_cache JSONB NOT NULL DEFAULT '{}'::jsonb;")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_project_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    work_code VARCHAR(40) NOT NULL
+                        REFERENCES audit_projects(work_code)
+                        ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_projects_updated
+                ON audit_projects(updated_at DESC);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_events_work
+                ON audit_project_events(work_code, created_at DESC);
+            """)
+
         conn.commit()
 
 def log_event_with_cursor(cur, project, event_type, details=None):
@@ -122,65 +176,576 @@ def fetch_work_record(work_code):
             cur.execute('\n                SELECT *\n                FROM audit_projects\n                WHERE UPPER(work_code) = UPPER(%s)\n                ', (work_code.strip(),))
             return cur.fetchone()
 
-def record_to_project(row):
-    return {'df': blob_to_df(row['population_blob']), 'mapping': row['mapping'] or {}, 'sample': blob_to_df(row['sample_blob']) if row['sample_blob'] is not None else pd.DataFrame(), 'params': row['params'] or {}, 'audit_results': row['audit_results'] or {}, 'created': row['created_at'].isoformat() if row.get('created_at') else datetime.now().isoformat(), 'source_name': row.get('source_name') or '', 'source_hash': row.get('source_hash') or '', 'work_code': row['work_code'], 'work_name': row['name'], 'responsible': row['responsible'], 'work_status': row.get('status') or 'En curso', 'db_version': int(row.get('version') or 1)}
 
-def persist_project(project, event_type='Guardado', details=None):
+def record_to_project(row):
+    source_streaming = bool(row.get('source_streaming'))
+
+    return {
+        'df': blob_to_df(row['population_blob']) if row.get('population_blob') is not None else None,
+        'analysis_df': None,
+        'mapping': row['mapping'] or {},
+        'sample': blob_to_df(row['sample_blob']) if row.get('sample_blob') is not None else pd.DataFrame(),
+        'params': row['params'] or {},
+        'audit_results': row['audit_results'] or {},
+        'analysis_cache': row.get('analysis_cache') or {},
+        'created': row['created_at'].isoformat() if row.get('created_at') else datetime.now().isoformat(),
+        'source_name': row.get('source_name') or '',
+        'source_hash': row.get('source_hash') or '',
+        'source_path': '',
+        'source_ext': row.get('source_ext') or '',
+        'source_encoding': row.get('source_encoding') or '',
+        'source_separator': row.get('source_separator') or '',
+        'source_rows': int(row.get('source_rows') or 0),
+        'source_columns': row.get('source_columns') or [],
+        'source_preview': row.get('source_preview') or [],
+        'source_streaming': source_streaming,
+        'work_code': row['work_code'],
+        'work_name': row['name'],
+        'responsible': row['responsible'],
+        'work_status': row.get('status') or 'En curso',
+        'db_version': int(row.get('version') or 1)
+    }
+
+
+def persist_project(
+    project,
+    event_type='Guardado',
+    details=None,
+    save_population=False,
+    save_sample=False
+):
     """
-    Guarda el expediente completo.
-    Usa control optimista de versión para evitar que dos personas
-    sobrescriban cambios sin advertencia.
+    Guarda el expediente sin volver a serializar la población completa
+    en cada acción. La población solo se escribe cuando realmente cambia.
     """
     work_code = project.get('work_code')
+
     if not work_code:
         return False
+
     if not database_available():
-        raise RuntimeError('La base de datos no está disponible. El trabajo no pudo guardarse de forma persistente.')
+        raise RuntimeError(
+            'La base de datos no está disponible. '
+            'El trabajo no pudo guardarse de forma persistente.'
+        )
+
     expected_version = int(project.get('db_version', 1) or 1)
+
+    population_blob = (
+        df_to_blob(project.get('df'))
+        if save_population
+        else None
+    )
+
+    sample_blob = (
+        df_to_blob(project.get('sample', pd.DataFrame()))
+        if save_sample
+        else None
+    )
+
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute('\n                UPDATE audit_projects\n                SET\n                    name = %s,\n                    responsible = %s,\n                    status = %s,\n                    source_name = %s,\n                    source_hash = %s,\n                    mapping = %s,\n                    params = %s,\n                    audit_results = %s,\n                    population_blob = %s,\n                    sample_blob = %s,\n                    updated_at = NOW(),\n                    version = version + 1\n                WHERE\n                    work_code = %s\n                    AND version = %s\n                RETURNING version\n                ', (project.get('work_name') or 'Trabajo de auditoría', project.get('responsible') or '', project.get('work_status') or 'En curso', project.get('source_name') or '', project.get('source_hash') or '', Json(project.get('mapping') or {}, dumps=json_dumps), Json(project.get('params') or {}, dumps=json_dumps), Json(project.get('audit_results') or {}, dumps=json_dumps), df_to_blob(project.get('df')), df_to_blob(project.get('sample', pd.DataFrame())), work_code, expected_version))
+            cur.execute("""
+                UPDATE audit_projects
+                SET
+                    name = %s,
+                    responsible = %s,
+                    status = %s,
+                    source_name = %s,
+                    source_hash = %s,
+                    mapping = %s,
+                    params = %s,
+                    audit_results = %s,
+                    source_rows = %s,
+                    source_columns = %s,
+                    source_preview = %s,
+                    source_ext = %s,
+                    source_encoding = %s,
+                    source_separator = %s,
+                    source_streaming = %s,
+                    analysis_cache = %s,
+                    population_blob =
+                        CASE WHEN %s THEN %s ELSE population_blob END,
+                    sample_blob =
+                        CASE WHEN %s THEN %s ELSE sample_blob END,
+                    updated_at = NOW(),
+                    version = version + 1
+                WHERE
+                    work_code = %s
+                    AND version = %s
+                RETURNING version
+            """, (
+                project.get('work_name') or 'Trabajo de auditoría',
+                project.get('responsible') or '',
+                project.get('work_status') or 'En curso',
+                project.get('source_name') or '',
+                project.get('source_hash') or '',
+                Json(project.get('mapping') or {}, dumps=json_dumps),
+                Json(project.get('params') or {}, dumps=json_dumps),
+                Json(project.get('audit_results') or {}, dumps=json_dumps),
+                int(project.get('source_rows') or 0),
+                Json(project.get('source_columns') or [], dumps=json_dumps),
+                Json(project.get('source_preview') or [], dumps=json_dumps),
+                project.get('source_ext') or '',
+                project.get('source_encoding') or '',
+                project.get('source_separator') or '',
+                bool(project.get('source_streaming')),
+                Json(project.get('analysis_cache') or {}, dumps=json_dumps),
+                bool(save_population),
+                population_blob,
+                bool(save_sample),
+                sample_blob,
+                work_code,
+                expected_version
+            ))
+
             updated = cur.fetchone()
+
             if not updated:
                 conn.rollback()
-                raise WorkConflictError('Este trabajo fue modificado desde otra sesión. Volvé a abrirlo antes de guardar para evitar sobrescribir cambios.')
+                raise WorkConflictError(
+                    'Este trabajo fue modificado desde otra sesión. '
+                    'Volvé a abrirlo antes de guardar para evitar sobrescribir cambios.'
+                )
+
             project['db_version'] = int(updated[0])
             log_event_with_cursor(cur, project, event_type, details or {})
+
         conn.commit()
+
     return True
+
 
 def create_persistent_work(project, name, responsible):
     if not database_available():
         raise RuntimeError('La conexión a PostgreSQL no está disponible.')
+
     name = (name or '').strip()
     responsible = (responsible or '').strip()
+
     if not name:
         raise ValueError('Ingresá un nombre para el trabajo.')
+
     if not responsible:
         raise ValueError('Ingresá el responsable del trabajo.')
+
     alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    access_key = ''.join((secrets.choice(alphabet) for _ in range(8)))
+    access_key = ''.join(secrets.choice(alphabet) for _ in range(8))
     access_key_hash = generate_password_hash(access_key)
+
+    population_blob = (
+        None
+        if project.get('source_streaming')
+        else df_to_blob(project.get('df'))
+    )
+
+    sample_blob = df_to_blob(
+        project.get('sample', pd.DataFrame())
+    )
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT nextval('audit_work_seq')")
             sequence_number = int(cur.fetchone()[0])
-            work_code = f'AUD-{datetime.now().year}-{sequence_number:06d}'
-            cur.execute('\n                INSERT INTO audit_projects (\n                    work_code,\n                    name,\n                    responsible,\n                    access_key_hash,\n                    status,\n                    source_name,\n                    source_hash,\n                    mapping,\n                    params,\n                    audit_results,\n                    population_blob,\n                    sample_blob,\n                    version\n                )\n                VALUES (\n                    %s, %s, %s, %s, %s,\n                    %s, %s, %s, %s, %s,\n                    %s, %s, 1\n                )\n                ', (work_code, name, responsible, access_key_hash, 'En curso', project.get('source_name') or '', project.get('source_hash') or '', Json(project.get('mapping') or {}, dumps=json_dumps), Json(project.get('params') or {}, dumps=json_dumps), Json(project.get('audit_results') or {}, dumps=json_dumps), df_to_blob(project.get('df')), df_to_blob(project.get('sample', pd.DataFrame()))))
+
+            work_code = (
+                f'AUD-{datetime.now().year}-{sequence_number:06d}'
+            )
+
+            cur.execute("""
+                INSERT INTO audit_projects (
+                    work_code,
+                    name,
+                    responsible,
+                    access_key_hash,
+                    status,
+                    source_name,
+                    source_hash,
+                    mapping,
+                    params,
+                    audit_results,
+                    population_blob,
+                    sample_blob,
+                    source_rows,
+                    source_columns,
+                    source_preview,
+                    source_ext,
+                    source_encoding,
+                    source_separator,
+                    source_streaming,
+                    analysis_cache,
+                    version
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, 1
+                )
+            """, (
+                work_code,
+                name,
+                responsible,
+                access_key_hash,
+                'En curso',
+                project.get('source_name') or '',
+                project.get('source_hash') or '',
+                Json(project.get('mapping') or {}, dumps=json_dumps),
+                Json(project.get('params') or {}, dumps=json_dumps),
+                Json(project.get('audit_results') or {}, dumps=json_dumps),
+                population_blob,
+                sample_blob,
+                int(project.get('source_rows') or 0),
+                Json(project.get('source_columns') or [], dumps=json_dumps),
+                Json(project.get('source_preview') or [], dumps=json_dumps),
+                project.get('source_ext') or '',
+                project.get('source_encoding') or '',
+                project.get('source_separator') or '',
+                bool(project.get('source_streaming')),
+                Json(project.get('analysis_cache') or {}, dumps=json_dumps)
+            ))
+
             project['work_code'] = work_code
             project['work_name'] = name
             project['responsible'] = responsible
             project['work_status'] = 'En curso'
             project['db_version'] = 1
-            log_event_with_cursor(cur, project, 'Trabajo creado', {'name': name, 'responsible': responsible})
+
+            log_event_with_cursor(
+                cur,
+                project,
+                'Trabajo creado',
+                {
+                    'name': name,
+                    'responsible': responsible
+                }
+            )
+
         conn.commit()
-    return (work_code, access_key)
+
+    return work_code, access_key
+
 
 def new_temp_project():
-    return {'df': None, 'mapping': {}, 'sample': pd.DataFrame(), 'params': {}, 'audit_results': {}, 'created': datetime.now().isoformat(), 'source_name': '', 'source_hash': '', 'work_code': '', 'work_name': '', 'responsible': '', 'work_status': 'Temporal', 'db_version': None}
+    return {
+        'df': None,
+        'analysis_df': None,
+        'mapping': {},
+        'sample': pd.DataFrame(),
+        'params': {},
+        'audit_results': {},
+        'analysis_cache': {},
+        'created': datetime.now().isoformat(),
+        'source_name': '',
+        'source_hash': '',
+        'source_path': '',
+        'source_ext': '',
+        'source_encoding': '',
+        'source_separator': '',
+        'source_rows': 0,
+        'source_columns': [],
+        'source_preview': [],
+        'source_streaming': False,
+        'work_code': '',
+        'work_name': '',
+        'responsible': '',
+        'work_status': 'Temporal',
+        'db_version': None
+    }
+
 
 def allowed_file(name):
-    return '.' in name and name.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return (
+        '.' in name
+        and name.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    )
+
+
+def compute_file_hash(path, chunk_size=4 * 1024 * 1024):
+    hasher = hashlib.sha256()
+
+    with open(path, 'rb') as handle:
+        for chunk in iter(
+            lambda: handle.read(chunk_size),
+            b''
+        ):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+def detect_csv_format(path):
+    """
+    Detecta codificación y separador sin cargar el archivo completo.
+    Prioriza ; porque es el formato más habitual de los CSV regionales,
+    pero también acepta coma, tab y |.
+    """
+    encodings = ('utf-8-sig', 'utf-8', 'latin1')
+
+    for encoding in encodings:
+        try:
+            with open(
+                path,
+                'r',
+                encoding=encoding,
+                newline=''
+            ) as handle:
+                sample = handle.read(65536)
+
+            if not sample:
+                return encoding, ';'
+
+            try:
+                dialect = csv.Sniffer().sniff(
+                    sample,
+                    delimiters=';,\t|'
+                )
+                separator = dialect.delimiter
+            except csv.Error:
+                counts = {
+                    ';': sample.count(';'),
+                    ',': sample.count(','),
+                    '\t': sample.count('\t'),
+                    '|': sample.count('|')
+                }
+                separator = max(
+                    counts,
+                    key=counts.get
+                )
+
+            # Valida que pandas pueda leer al menos algunas filas.
+            pd.read_csv(
+                path,
+                sep=separator,
+                encoding=encoding,
+                nrows=5,
+                low_memory=True
+            )
+
+            return encoding, separator
+
+        except UnicodeDecodeError:
+            continue
+
+    return 'latin1', ';'
+
+
+def read_csv_metadata(path):
+    encoding, separator = detect_csv_format(path)
+
+    preview_df = pd.read_csv(
+        path,
+        sep=separator,
+        encoding=encoding,
+        nrows=10,
+        low_memory=True
+    )
+
+    preview_df.columns = [
+        str(column).strip()
+        for column in preview_df.columns
+    ]
+
+    rows = 0
+
+    # Cuenta registros leyendo solamente la primera columna.
+    for chunk in pd.read_csv(
+        path,
+        sep=separator,
+        encoding=encoding,
+        usecols=[0],
+        chunksize=100000,
+        low_memory=True
+    ):
+        rows += len(chunk)
+
+    return (
+        preview_df,
+        rows,
+        encoding,
+        separator
+    )
+
+
+def analysis_dataframe(project, id_col=None, amount_col=None):
+    """
+    Devuelve únicamente las columnas necesarias para el análisis.
+    Para CSV grandes evita cargar todas las columnas en memoria.
+    """
+    if not project.get('source_streaming'):
+        return project.get('df')
+
+    cached = project.get('analysis_df')
+
+    if (
+        cached is not None
+        and id_col in cached.columns
+        and amount_col in cached.columns
+    ):
+        return cached
+
+    path = project.get('source_path')
+
+    if not path or not os.path.exists(path):
+        raise ValueError(
+            'La población original ya no está disponible en el servidor. '
+            'Volvé a cargar el archivo fuente para continuar.'
+        )
+
+    wanted = {
+        str(id_col).strip(),
+        str(amount_col).strip()
+    }
+
+    df = pd.read_csv(
+        path,
+        sep=project.get('source_separator') or ';',
+        encoding=project.get('source_encoding') or 'utf-8',
+        usecols=lambda column: str(column).strip() in wanted,
+        low_memory=True
+    )
+
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
+
+    missing = [
+        column
+        for column in wanted
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            'No se encontraron las columnas seleccionadas: '
+            + ', '.join(sorted(missing))
+        )
+
+    # Convierte el importe una sola vez y conserva una columna numérica
+    # mucho más liviana que los textos con formato regional.
+    df[amount_col] = parse_amount(
+        df[amount_col]
+    )
+
+    project['analysis_df'] = df
+    project['source_rows'] = int(len(df))
+
+    return df
+
+
+def hydrate_streaming_sample(project, selected):
+    """
+    Recupera del CSV solo las filas seleccionadas y todas sus columnas.
+    Trabaja por bloques pequeños para mantener bajo el uso de RAM.
+    """
+    if selected is None or selected.empty:
+        return pd.DataFrame()
+
+    path = project.get('source_path')
+
+    if not path or not os.path.exists(path):
+        raise ValueError(
+            'La población original ya no está disponible en el servidor. '
+            'Volvé a cargar el archivo fuente para generar la muestra.'
+        )
+
+    selected_indices = (
+        selected['_original_index']
+        .astype(int)
+        .to_numpy()
+    )
+
+    selected_set = set(
+        selected_indices.tolist()
+    )
+
+    pieces = []
+    offset = 0
+
+    reader = pd.read_csv(
+        path,
+        sep=project.get('source_separator') or ';',
+        encoding=project.get('source_encoding') or 'utf-8',
+        chunksize=25000,
+        low_memory=True
+    )
+
+    for chunk in reader:
+        chunk.columns = [
+            str(column).strip()
+            for column in chunk.columns
+        ]
+
+        start = offset
+        stop = offset + len(chunk)
+
+        local_indices = [
+            index
+            for index in selected_set
+            if start <= index < stop
+        ]
+
+        if local_indices:
+            positions = np.array(
+                local_indices,
+                dtype=np.int64
+            ) - start
+
+            part = chunk.iloc[positions].copy()
+
+            part['_original_index'] = np.array(
+                local_indices,
+                dtype=np.int64
+            )
+
+            pieces.append(part)
+
+        offset = stop
+
+    if not pieces:
+        return pd.DataFrame()
+
+    source_rows = pd.concat(
+        pieces,
+        ignore_index=True
+    )
+
+    meta_columns = [
+        '_original_index',
+        '_amount_numeric',
+        'Motivo de selección',
+        'Método',
+        'Tipo_Seleccion',
+        'Estrato'
+    ]
+
+    meta = selected[
+        [
+            column
+            for column in meta_columns
+            if column in selected.columns
+        ]
+    ].copy()
+
+    meta['_selection_order'] = np.arange(
+        len(meta)
+    )
+
+    sample = source_rows.merge(
+        meta,
+        on='_original_index',
+        how='inner'
+    )
+
+    sample = (
+        sample
+        .sort_values('_selection_order')
+        .drop(columns=['_selection_order'])
+        .reset_index(drop=True)
+    )
+
+    return sample
 
 def get_project():
     pid = session.get('project_id')
@@ -203,23 +768,85 @@ def get_project():
     session['project_id'] = pid
     return projects[pid]
 
+
 def project_state_payload(project):
     df = project.get('df')
     sample = project.get('sample', pd.DataFrame())
     mapping = project.get('mapping') or {}
     params = project.get('params') or {}
+
     population_state = None
-    if df is not None:
+
+    if project.get('source_streaming'):
+        if project.get('source_rows') or project.get('source_columns'):
+            population_state = {
+                'rows': int(project.get('source_rows') or 0),
+                'columns': project.get('source_columns') or [],
+                'preview': project.get('source_preview') or [],
+                'analysis': project.get('analysis_cache') or None
+            }
+
+    elif df is not None:
         amount_col = mapping.get('amount_col')
-        population_state = {'rows': int(len(df)), 'columns': list(df.columns), 'preview': df.head(10).fillna('').to_dict(orient='records'), 'analysis': population_analysis(df, amount_col) if amount_col in df.columns else None}
+
+        analysis = project.get('analysis_cache') or None
+
+        if (
+            analysis is None
+            and amount_col in df.columns
+        ):
+            analysis = population_analysis(
+                df,
+                amount_col
+            )
+
+        population_state = {
+            'rows': int(len(df)),
+            'columns': list(df.columns),
+            'preview': (
+                df.head(10)
+                .fillna('')
+                .to_dict(orient='records')
+            ),
+            'analysis': analysis
+        }
+
     sample_preview = []
-    if sample is not None and (not sample.empty):
-        sample_preview = sample.drop(columns=['_amount_numeric'], errors='ignore').head(500).fillna('').to_dict(orient='records')
-    return {'work': {'work_code': project.get('work_code') or '', 'name': project.get('work_name') or '', 'responsible': project.get('responsible') or '', 'status': project.get('work_status') or '', 'created': project.get('created') or '', 'source_name': project.get('source_name') or '', 'source_hash': project.get('source_hash') or '', 'version': project.get('db_version')}, 'mapping': mapping, 'params': params, 'population': population_state, 'sample': {'rows': int(len(sample)) if sample is not None else 0, 'preview': sample_preview}, 'results': list((project.get('audit_results') or {}).values())}
-try:
-    init_db()
-except Exception as exc:
-    print('No se pudo inicializar PostgreSQL. La app seguirá funcionando en modo temporal:', exc)
+
+    if sample is not None and not sample.empty:
+        sample_preview = (
+            sample
+            .drop(
+                columns=['_amount_numeric'],
+                errors='ignore'
+            )
+            .head(500)
+            .fillna('')
+            .to_dict(orient='records')
+        )
+
+    return {
+        'work': {
+            'work_code': project.get('work_code') or '',
+            'name': project.get('work_name') or '',
+            'responsible': project.get('responsible') or '',
+            'status': project.get('work_status') or '',
+            'created': project.get('created') or '',
+            'source_name': project.get('source_name') or '',
+            'source_hash': project.get('source_hash') or '',
+            'version': project.get('db_version')
+        },
+        'mapping': mapping,
+        'params': params,
+        'population': population_state,
+        'sample': {
+            'rows': int(len(sample)) if sample is not None else 0,
+            'preview': sample_preview
+        },
+        'results': list(
+            (project.get('audit_results') or {}).values()
+        )
+    }
 
 def parse_amount(series):
     if pd.api.types.is_numeric_dtype(series):
@@ -284,91 +911,393 @@ def add_selection(base, idx, reason, method, selection_type, stratum):
     out['Estrato'] = stratum
     return out
 
+
 def make_sample(df, params):
     id_col = params.get('id_col')
     amount_col = params.get('amount_col')
     method = params.get('method', 'random')
-    seed = int(params.get('seed') or np.random.randint(1, 2 ** 31 - 1))
+    seed = int(
+        params.get('seed')
+        or np.random.randint(1, 2 ** 31 - 1)
+    )
+
     rng = np.random.default_rng(seed)
-    n = int(params.get('n', 0))
-    work = df.copy()
-    selected = []
-    excluded = set()
-    if amount_col and amount_col in work.columns:
-        work['_amount_numeric'] = parse_amount(work[amount_col]).fillna(0)
+    n = int(params.get('n', 0) or 0)
+
+    if df is None or df.empty:
+        return pd.DataFrame(), seed
+
+    if amount_col and amount_col in df.columns:
+        amount = parse_amount(
+            df[amount_col]
+        ).fillna(0)
     else:
-        work['_amount_numeric'] = 0.0
-    threshold = float(params.get('significant_threshold') or 0)
-    if params.get('include_materiality') and threshold > 0:
-        idx = work.index[work['_amount_numeric'].abs() >= threshold]
-        if len(idx):
-            selected.append(add_selection(work, idx, 'Partida significativa', 'Revisión 100%', 'Dirigida_100', '100%'))
-            excluded.update(idx.tolist())
+        amount = pd.Series(
+            0.0,
+            index=df.index
+        )
+
+    selected = []
+    excluded = np.zeros(
+        len(df),
+        dtype=bool
+    )
+
+    def append_selection(
+        indices,
+        reason,
+        method_name,
+        selection_type,
+        stratum
+    ):
+        indices = np.asarray(
+            list(indices),
+            dtype=np.int64
+        )
+
+        if len(indices) == 0:
+            return
+
+        selected.append(
+            (
+                indices,
+                reason,
+                method_name,
+                selection_type,
+                stratum
+            )
+        )
+
+        excluded[indices] = True
+
+    threshold = float(
+        params.get('significant_threshold') or 0
+    )
+
+    if (
+        params.get('include_materiality')
+        and threshold > 0
+    ):
+        idx = amount.index[
+            amount.abs() >= threshold
+        ].to_numpy(dtype=np.int64)
+
+        append_selection(
+            idx,
+            'Partida significativa',
+            'Revisión 100%',
+            'Dirigida_100',
+            '100%'
+        )
+
     if params.get('include_outliers'):
-        x = work.loc[~work.index.isin(excluded), '_amount_numeric']
-        if len(x):
+        available_idx = np.flatnonzero(
+            ~excluded
+        )
+
+        if len(available_idx):
+            x = amount.iloc[
+                available_idx
+            ]
+
             q1 = x.quantile(0.25)
             q3 = x.quantile(0.75)
             iqr = q3 - q1
+
             lower = q1 - 3 * iqr
             upper = q3 + 3 * iqr
-            idx = x.index[(x < lower) | (x > upper)]
-            if len(idx):
-                selected.append(add_selection(work, idx, 'Valor atípico', 'Revisión 100%', 'Dirigida_100', '100%'))
-                excluded.update(idx.tolist())
-    residual = work.loc[~work.index.isin(excluded)].copy()
-    n = min(n, len(residual))
+
+            idx = x.index[
+                (x < lower) | (x > upper)
+            ].to_numpy(dtype=np.int64)
+
+            append_selection(
+                idx,
+                'Valor atípico',
+                'Revisión 100%',
+                'Dirigida_100',
+                '100%'
+            )
+
+    residual_idx = np.flatnonzero(
+        ~excluded
+    )
+
+    n = min(
+        n,
+        len(residual_idx)
+    )
+
     if n > 0 and method == 'random':
-        idx = rng.choice(residual.index.to_numpy(), size=n, replace=False)
-        selected.append(add_selection(work, idx, 'Selección aleatoria', 'Aleatorio simple', 'Probabilistica', 'Probabilístico'))
+        idx = rng.choice(
+            residual_idx,
+            size=n,
+            replace=False
+        )
+
+        append_selection(
+            idx,
+            'Selección aleatoria',
+            'Aleatorio simple',
+            'Probabilistica',
+            'Probabilístico'
+        )
+
     elif n > 0 and method == 'systematic':
-        ordered = residual.sort_values(id_col) if id_col in residual.columns else residual
-        interval = len(ordered) / n
-        start = rng.uniform(0, interval)
-        pos = np.floor(start + np.arange(n) * interval).astype(int)
-        pos = np.clip(pos, 0, len(ordered) - 1)
-        idx = ordered.index[pos]
-        selected.append(add_selection(work, idx, 'Selección sistemática', 'Sistemático', 'Probabilistica', 'Probabilístico'))
-    elif n > 0 and method == 'mus':
-        positive = residual.loc[residual['_amount_numeric'] > 0].copy()
-        total_positive = float(positive['_amount_numeric'].sum())
-        if len(positive) and total_positive > 0:
-            interval = total_positive / n
-            start = rng.uniform(0, interval)
-            points = start + np.arange(n) * interval
-            cumulative = positive['_amount_numeric'].cumsum().to_numpy()
-            locs = np.searchsorted(cumulative, points, side='left')
-            locs = np.clip(locs, 0, len(positive) - 1)
-            idx = positive.index[np.unique(locs)]
-            selected.append(add_selection(work, idx, 'Selección por unidad monetaria', 'MUS / PPS', 'Probabilistica', 'Probabilístico'))
-    elif n > 0 and method == 'topn':
-        idx = residual['_amount_numeric'].abs().nlargest(n).index
-        selected.append(add_selection(work, idx, 'Mayores importes', 'Top N', 'Dirigida', 'Dirigido'))
-    elif n > 0 and method == 'stratified':
-        values = residual['_amount_numeric'].abs()
-        q50 = values.quantile(0.5)
-        q90 = values.quantile(0.9)
-        if q50 == q90:
-            idx = rng.choice(residual.index.to_numpy(), size=n, replace=False)
-            selected.append(add_selection(work, idx, 'Selección estratificada', 'Estratificado', 'Probabilistica', 'Probabilístico'))
+        if id_col and id_col in df.columns:
+            ordered_idx = (
+                df.iloc[residual_idx][id_col]
+                .sort_values(kind='mergesort')
+                .index
+                .to_numpy(dtype=np.int64)
+            )
         else:
-            residual['_stratum'] = pd.cut(values, bins=[-np.inf, q50, q90, np.inf], labels=['Bajo', 'Medio', 'Alto'], include_lowest=True)
+            ordered_idx = residual_idx
+
+        interval = len(ordered_idx) / n
+        start = rng.uniform(0, interval)
+
+        positions = np.floor(
+            start + np.arange(n) * interval
+        ).astype(int)
+
+        positions = np.clip(
+            positions,
+            0,
+            len(ordered_idx) - 1
+        )
+
+        idx = ordered_idx[positions]
+
+        append_selection(
+            idx,
+            'Selección sistemática',
+            'Sistemático',
+            'Probabilistica',
+            'Probabilístico'
+        )
+
+    elif n > 0 and method == 'mus':
+        positive_idx = residual_idx[
+            amount.iloc[residual_idx]
+            .to_numpy() > 0
+        ]
+
+        if len(positive_idx):
+            positive_values = amount.iloc[
+                positive_idx
+            ]
+
+            total_positive = float(
+                positive_values.sum()
+            )
+
+            if total_positive > 0:
+                interval = total_positive / n
+                start = rng.uniform(
+                    0,
+                    interval
+                )
+
+                points = (
+                    start
+                    + np.arange(n) * interval
+                )
+
+                cumulative = (
+                    positive_values
+                    .cumsum()
+                    .to_numpy()
+                )
+
+                locations = np.searchsorted(
+                    cumulative,
+                    points,
+                    side='left'
+                )
+
+                locations = np.clip(
+                    locations,
+                    0,
+                    len(positive_idx) - 1
+                )
+
+                idx = positive_idx[
+                    np.unique(locations)
+                ]
+
+                append_selection(
+                    idx,
+                    'Selección por unidad monetaria',
+                    'MUS / PPS',
+                    'Probabilistica',
+                    'Probabilístico'
+                )
+
+    elif n > 0 and method == 'topn':
+        idx = (
+            amount.iloc[residual_idx]
+            .abs()
+            .nlargest(n)
+            .index
+            .to_numpy(dtype=np.int64)
+        )
+
+        append_selection(
+            idx,
+            'Mayores importes',
+            'Top N',
+            'Dirigida',
+            'Dirigido'
+        )
+
+    elif n > 0 and method == 'stratified':
+        values = amount.iloc[
+            residual_idx
+        ].abs()
+
+        q50 = values.quantile(0.50)
+        q90 = values.quantile(0.90)
+
+        if q50 == q90:
+            idx = rng.choice(
+                residual_idx,
+                size=n,
+                replace=False
+            )
+
+            append_selection(
+                idx,
+                'Selección estratificada',
+                'Estratificado',
+                'Probabilistica',
+                'Probabilístico'
+            )
+
+        else:
+            strata = [
+                values.index[
+                    values <= q50
+                ].to_numpy(dtype=np.int64),
+
+                values.index[
+                    (values > q50)
+                    & (values <= q90)
+                ].to_numpy(dtype=np.int64),
+
+                values.index[
+                    values > q90
+                ].to_numpy(dtype=np.int64)
+            ]
+
             picks = []
-            for _, group in residual.groupby('_stratum', observed=True):
-                take = min(len(group), max(1, round(n * len(group) / len(residual))))
-                picks.extend(rng.choice(group.index.to_numpy(), size=take, replace=False).tolist())
-            picks = list(dict.fromkeys(picks))
+
+            for group in strata:
+                if len(group) == 0:
+                    continue
+
+                take = min(
+                    len(group),
+                    max(
+                        1,
+                        round(
+                            n
+                            * len(group)
+                            / len(residual_idx)
+                        )
+                    )
+                )
+
+                picks.extend(
+                    rng.choice(
+                        group,
+                        size=take,
+                        replace=False
+                    ).tolist()
+                )
+
+            picks = list(
+                dict.fromkeys(picks)
+            )
+
+            if len(picks) > n:
+                picks = rng.choice(
+                    np.array(picks),
+                    size=n,
+                    replace=False
+                ).tolist()
+
             if len(picks) < n:
-                remaining = residual.index[~residual.index.isin(picks)]
-                extra = min(n - len(picks), len(remaining))
+                remaining = np.setdiff1d(
+                    residual_idx,
+                    np.array(
+                        picks,
+                        dtype=np.int64
+                    ),
+                    assume_unique=False
+                )
+
+                extra = min(
+                    n - len(picks),
+                    len(remaining)
+                )
+
                 if extra:
-                    picks.extend(rng.choice(remaining.to_numpy(), size=extra, replace=False).tolist())
-            selected.append(add_selection(work, picks[:n], 'Selección estratificada', 'Estratificado', 'Probabilistica', 'Probabilístico'))
+                    picks.extend(
+                        rng.choice(
+                            remaining,
+                            size=extra,
+                            replace=False
+                        ).tolist()
+                    )
+
+            append_selection(
+                picks[:n],
+                'Selección estratificada',
+                'Estratificado',
+                'Probabilistica',
+                'Probabilístico'
+            )
+
     if not selected:
-        return (pd.DataFrame(), seed)
-    out = pd.concat(selected, ignore_index=False)
-    out = out.drop_duplicates(subset=['_original_index'], keep='first')
-    return (out, seed)
+        return pd.DataFrame(), seed
+
+    frames = []
+
+    for (
+        indices,
+        reason,
+        method_name,
+        selection_type,
+        stratum
+    ) in selected:
+        frame = add_selection(
+            df,
+            indices,
+            reason,
+            method_name,
+            selection_type,
+            stratum
+        )
+
+        frame['_amount_numeric'] = (
+            amount.loc[frame.index]
+            .to_numpy()
+        )
+
+        frames.append(frame)
+
+    out = pd.concat(
+        frames,
+        ignore_index=False
+    )
+
+    out = out.drop_duplicates(
+        subset=['_original_index'],
+        keep='first'
+    )
+
+    return out, seed
 
 def normalize_result(item):
     idx = item.get('_original_index')
@@ -409,64 +1338,297 @@ def get_audit_rows(project):
         rows.append({'_original_index': idx, 'Estrato': row.get('Estrato', ''), 'Método': row.get('Método', ''), 'Motivo de selección': row.get('Motivo de selección', ''), 'Resultado de revisión': result.get('status', ''), 'Importe registrado': result.get('registered', ''), 'Importe validado': result.get('validated', ''), 'Diferencia': result.get('difference', ''), 'Tipo de excepción': result.get('exception_type', ''), 'Comentario del auditor': result.get('comment', ''), 'Referencia de evidencia': result.get('evidence', '')})
     return rows
 
+
 def calculate_extrapolation(project):
     sample = project.get('sample', pd.DataFrame())
-    df = project.get('df')
     params = project.get('params', {})
     results = project.get('audit_results', {})
-    if df is None or sample.empty:
-        raise ValueError('No existe muestra generada')
+
     amount_col = params.get('amount_col')
-    if not amount_col or amount_col not in df.columns:
-        raise ValueError('No se encuentra la columna de importe configurada')
-    total_population = float(parse_amount(df[amount_col]).fillna(0).abs().sum())
-    s = sample.copy()
-    if '_amount_numeric' not in s.columns:
-        s['_amount_numeric'] = parse_amount(s[amount_col]).fillna(0)
-    s['_amount_abs'] = s['_amount_numeric'].abs()
-    s['error'] = [float(results.get(str(int(i)), {}).get('difference', 0) or 0) for i in s['_original_index']]
-    s['status'] = [results.get(str(int(i)), {}).get('status', '') for i in s['_original_index']]
-    if 'Tipo_Seleccion' in s.columns:
-        hundred = s[s['Tipo_Seleccion'] == 'Dirigida_100']
-        prob = s[s['Tipo_Seleccion'] == 'Probabilistica']
-        directed = s[s['Tipo_Seleccion'] == 'Dirigida']
+    id_col = params.get('id_col')
+
+    if sample.empty:
+        raise ValueError('No existe muestra generada')
+
+    if project.get('source_streaming'):
+        df = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
     else:
-        norm = s.get('Estrato', pd.Series('', index=s.index)).astype(str).str.lower()
-        hundred = s[norm.eq('100%')]
-        prob = s[norm.str.contains('probabil', na=False)]
-        directed = s[~s.index.isin(hundred.index) & ~s.index.isin(prob.index)]
-    observed_100 = float(hundred['error'].abs().sum())
-    observed_prob = float(prob['error'].abs().sum())
-    directed_observed = float(directed['error'].abs().sum())
-    prob_sample_amount = float(prob['_amount_abs'].sum())
-    excluded_ids = set(hundred['_original_index'].astype(int).tolist())
-    excluded_ids.update(directed['_original_index'].astype(int).tolist())
-    residual_population = float(parse_amount(df.loc[~df.index.isin(excluded_ids), amount_col]).fillna(0).abs().sum())
-    error_rate = observed_prob / prob_sample_amount if prob_sample_amount else 0.0
-    projected = error_rate * residual_population if len(prob) else None
-    identified = observed_100 + observed_prob + directed_observed
-    total_estimated = observed_100 + directed_observed + (projected or 0)
-    exception_statuses = {'Excepción monetaria', 'Excepción no monetaria', 'Excepción', 'Error monetario', 'Error no monetario'}
-    exceptions = int(s['status'].isin(exception_statuses).sum())
-    materiality = float(params.get('materiality') or 0)
-    tolerable = float(params.get('tolerable_error') or 0)
+        df = project.get('df')
+
+    if df is None:
+        raise ValueError('No existe población cargada')
+
+    if not amount_col or amount_col not in df.columns:
+        raise ValueError(
+            'No se encuentra la columna de importe configurada'
+        )
+
+    total_population = float(
+        parse_amount(
+            df[amount_col]
+        )
+        .fillna(0)
+        .abs()
+        .sum()
+    )
+
+    s = sample.copy()
+
+    if '_amount_numeric' not in s.columns:
+        s['_amount_numeric'] = parse_amount(
+            s[amount_col]
+        ).fillna(0)
+
+    s['_amount_abs'] = (
+        s['_amount_numeric']
+        .abs()
+    )
+
+    s['error'] = [
+        float(
+            results
+            .get(str(int(index)), {})
+            .get('difference', 0)
+            or 0
+        )
+        for index in s['_original_index']
+    ]
+
+    s['status'] = [
+        results
+        .get(str(int(index)), {})
+        .get('status', '')
+        for index in s['_original_index']
+    ]
+
+    if 'Tipo_Seleccion' in s.columns:
+        hundred = s[
+            s['Tipo_Seleccion'] == 'Dirigida_100'
+        ]
+
+        prob = s[
+            s['Tipo_Seleccion'] == 'Probabilistica'
+        ]
+
+        directed = s[
+            s['Tipo_Seleccion'] == 'Dirigida'
+        ]
+
+    else:
+        norm = (
+            s.get(
+                'Estrato',
+                pd.Series('', index=s.index)
+            )
+            .astype(str)
+            .str.lower()
+        )
+
+        hundred = s[
+            norm.eq('100%')
+        ]
+
+        prob = s[
+            norm.str.contains(
+                'probabil',
+                na=False
+            )
+        ]
+
+        directed = s[
+            ~s.index.isin(hundred.index)
+            & ~s.index.isin(prob.index)
+        ]
+
+    observed_100 = float(
+        hundred['error'].abs().sum()
+    )
+
+    observed_prob = float(
+        prob['error'].abs().sum()
+    )
+
+    directed_observed = float(
+        directed['error'].abs().sum()
+    )
+
+    prob_sample_amount = float(
+        prob['_amount_abs'].sum()
+    )
+
+    excluded_ids = set(
+        hundred['_original_index']
+        .astype(int)
+        .tolist()
+    )
+
+    excluded_ids.update(
+        directed['_original_index']
+        .astype(int)
+        .tolist()
+    )
+
+    amount_series = parse_amount(
+        df[amount_col]
+    ).fillna(0)
+
+    if excluded_ids:
+        keep_mask = ~df.index.isin(
+            excluded_ids
+        )
+
+        residual_population = float(
+            amount_series.loc[
+                keep_mask
+            ]
+            .abs()
+            .sum()
+        )
+
+    else:
+        residual_population = float(
+            amount_series
+            .abs()
+            .sum()
+        )
+
+    error_rate = (
+        observed_prob / prob_sample_amount
+        if prob_sample_amount
+        else 0.0
+    )
+
+    projected = (
+        error_rate * residual_population
+        if len(prob)
+        else None
+    )
+
+    identified = (
+        observed_100
+        + observed_prob
+        + directed_observed
+    )
+
+    total_estimated = (
+        observed_100
+        + directed_observed
+        + (projected or 0)
+    )
+
+    exception_statuses = {
+        'Excepción monetaria',
+        'Excepción no monetaria',
+        'Excepción',
+        'Error monetario',
+        'Error no monetario'
+    }
+
+    exceptions = int(
+        s['status']
+        .isin(exception_statuses)
+        .sum()
+    )
+
+    materiality = float(
+        params.get('materiality') or 0
+    )
+
+    tolerable = float(
+        params.get('tolerable_error') or 0
+    )
 
     def traffic(value, limit):
         if not limit:
             return 'sin umbral'
+
         ratio = abs(value) / abs(limit)
+
         if ratio < 0.8:
             return 'verde'
+
         if ratio <= 1:
             return 'amarillo'
+
         return 'rojo'
+
     method = params.get('method', '')
     message = None
+
     if not len(prob):
-        message = 'La muestra no contiene registros probabilísticos. Las selecciones dirigidas o revisadas al 100% no deben extrapolarse estadísticamente.'
+        message = (
+            'La muestra no contiene registros probabilísticos. '
+            'Las selecciones dirigidas o revisadas al 100% '
+            'no deben extrapolarse estadísticamente.'
+        )
+
     elif method == 'mus':
-        message = 'La muestra MUS/PPS es probabilística. La proyección mostrada es una estimación proporcional simplificada; una evaluación MUS formal requiere su metodología específica.'
-    return {'extrapolable': bool(len(prob)), 'message': message, 'method': method, 'total_population': total_population, 'hundred_population': float(hundred['_amount_abs'].sum()), 'residual_population': residual_population, 'probabilistic_sample_amount': prob_sample_amount, 'probabilistic_sample_count': int(len(prob)), 'hundred_count': int(len(hundred)), 'directed_count': int(len(directed)), 'observed_100': observed_100, 'observed_residual': observed_prob, 'directed_observed': directed_observed, 'effectively_identified': identified, 'error_rate': error_rate, 'projected_residual': projected, 'total_estimated': total_estimated, 'exceptions': exceptions, 'sample_count': int(len(sample)), 'coverage_count': len(sample) / len(df) * 100 if len(df) else 0, 'coverage_amount': float(s['_amount_abs'].sum()) / total_population * 100 if total_population else 0, 'materiality': materiality, 'tolerable_error': tolerable, 'checks': {'observed_vs_materiality': traffic(identified, materiality), 'projected_vs_materiality': traffic(projected or 0, materiality), 'total_vs_materiality': traffic(total_estimated, materiality), 'projected_vs_tolerable': traffic(projected or 0, tolerable)}}
+        message = (
+            'La muestra MUS/PPS es probabilística. '
+            'La proyección mostrada es una estimación proporcional '
+            'simplificada; una evaluación MUS formal requiere '
+            'su metodología específica.'
+        )
+
+    return {
+        'extrapolable': bool(len(prob)),
+        'message': message,
+        'method': method,
+        'total_population': total_population,
+        'hundred_population': float(
+            hundred['_amount_abs'].sum()
+        ),
+        'residual_population': residual_population,
+        'probabilistic_sample_amount': prob_sample_amount,
+        'probabilistic_sample_count': int(len(prob)),
+        'hundred_count': int(len(hundred)),
+        'directed_count': int(len(directed)),
+        'observed_100': observed_100,
+        'observed_residual': observed_prob,
+        'directed_observed': directed_observed,
+        'effectively_identified': identified,
+        'error_rate': error_rate,
+        'projected_residual': projected,
+        'total_estimated': total_estimated,
+        'exceptions': exceptions,
+        'sample_count': int(len(sample)),
+        'coverage_count': (
+            len(sample) / len(df) * 100
+            if len(df)
+            else 0
+        ),
+        'coverage_amount': (
+            float(s['_amount_abs'].sum())
+            / total_population
+            * 100
+            if total_population
+            else 0
+        ),
+        'materiality': materiality,
+        'tolerable_error': tolerable,
+        'checks': {
+            'observed_vs_materiality': traffic(
+                identified,
+                materiality
+            ),
+            'projected_vs_materiality': traffic(
+                projected or 0,
+                materiality
+            ),
+            'total_vs_materiality': traffic(
+                total_estimated,
+                materiality
+            ),
+            'projected_vs_tolerable': traffic(
+                projected or 0,
+                tolerable
+            )
+        }
+    }
 
 @app.route('/api/work/db-status', methods=['GET'])
 def work_db_status():
@@ -599,78 +1761,264 @@ def work_events():
 def index():
     return render_template('index.html')
 
+
 @app.route('/api/upload', methods=['POST'])
 def upload():
     if 'file' not in request.files:
-        return (jsonify(error='Seleccione un archivo'), 400)
+        return jsonify(
+            error='Seleccione un archivo'
+        ), 400
+
     f = request.files['file']
+
     if not f.filename or not allowed_file(f.filename):
-        return (jsonify(error='Formato no admitido. Use CSV, XLSX, XLS o XLSB.'), 400)
+        return jsonify(
+            error=(
+                'Formato no admitido. '
+                'Use CSV, XLSX, XLS o XLSB.'
+            )
+        ), 400
+
     name = f.filename
-    path = os.path.join(UPLOAD_FOLDER, f'{uuid.uuid4()}_{name}')
-    f.save(path)
+    ext = name.rsplit('.', 1)[1].lower()
+
+    project = get_project()
+
+    old_path = project.get('source_path')
+
+    if (
+        old_path
+        and os.path.exists(old_path)
+        and os.path.dirname(old_path) == UPLOAD_FOLDER
+    ):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    path = os.path.join(
+        UPLOAD_FOLDER,
+        f'{uuid.uuid4()}_{name}'
+    )
+
     try:
-        ext = name.rsplit('.', 1)[1].lower()
+        f.save(path)
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo guardar el archivo: ' + str(exc)
+        ), 500
+
+    try:
+        file_hash = compute_file_hash(path)
+
         if ext == 'csv':
-            try:
-                df = pd.read_csv(
-                    path,
-                    sep=';',
-                    low_memory=False
-                )
-            except UnicodeDecodeError:
-                df = pd.read_csv(
-                    path,
-                    sep=';',
-                    low_memory=False,
-                    encoding='latin1'
-                )
+            (
+                preview_df,
+                row_count,
+                encoding,
+                separator
+            ) = read_csv_metadata(path)
+
+            columns = list(
+                preview_df.columns
+            )
+
+            preview = (
+                preview_df
+                .fillna('')
+                .to_dict(orient='records')
+            )
+
+            # No se carga el millón de filas completo en RAM.
+            project['df'] = None
+            project['analysis_df'] = None
+            project['source_streaming'] = True
+            project['source_encoding'] = encoding
+            project['source_separator'] = separator
+
         else:
+            file_size = os.path.getsize(path)
+
+            # Excel grande consume muchísima RAM con openpyxl.
+            # En ese caso se devuelve un error claro en vez de un 502.
+            if file_size > 75 * 1024 * 1024:
+                raise ValueError(
+                    'El Excel es demasiado grande para procesarlo '
+                    'de forma segura en este servidor. '
+                    'Guardalo como CSV y volvé a cargarlo.'
+                )
+
             df = pd.read_excel(
                 path,
-                engine='pyxlsb' if ext == 'xlsb' else None
+                engine=(
+                    'pyxlsb'
+                    if ext == 'xlsb'
+                    else None
+                )
             )
-    except Exception as e:
-        return (jsonify(error='No se pudo leer el archivo: ' + str(e)), 400)
-    df.columns = [str(c).strip() for c in df.columns]
-    p = get_project()
-    p['df'] = df
-    p['mapping'] = {}
-    p['sample'] = pd.DataFrame()
-    p['params'] = {}
-    p['audit_results'] = {}
-    p['source_name'] = name
-    with open(path, 'rb') as h:
-        p['source_hash'] = hashlib.sha256(h.read()).hexdigest()
-    if p.get('work_code'):
+
+            df.columns = [
+                str(column).strip()
+                for column in df.columns
+            ]
+
+            project['df'] = df
+            project['analysis_df'] = None
+            project['source_streaming'] = False
+            project['source_encoding'] = ''
+            project['source_separator'] = ''
+
+            row_count = int(len(df))
+            columns = list(df.columns)
+
+            preview = (
+                df.head(10)
+                .fillna('')
+                .to_dict(orient='records')
+            )
+
+    except Exception as exc:
         try:
-            persist_project(p, 'Población cargada', {'source_name': name, 'rows': int(len(df))})
+            os.remove(path)
+        except OSError:
+            pass
+
+        return jsonify(
+            error='No se pudo leer el archivo: ' + str(exc)
+        ), 400
+
+    project['mapping'] = {}
+    project['sample'] = pd.DataFrame()
+    project['params'] = {}
+    project['audit_results'] = {}
+    project['analysis_cache'] = {}
+    project['source_name'] = name
+    project['source_hash'] = file_hash
+    project['source_path'] = path
+    project['source_ext'] = ext
+    project['source_rows'] = int(row_count)
+    project['source_columns'] = columns
+    project['source_preview'] = preview
+
+    if project.get('work_code'):
+        try:
+            persist_project(
+                project,
+                'Población cargada',
+                {
+                    'source_name': name,
+                    'rows': int(row_count)
+                },
+                save_population=True,
+                save_sample=True
+            )
+
         except WorkConflictError as exc:
-            return (jsonify(error=str(exc), conflict=True), 409)
+            return jsonify(
+                error=str(exc),
+                conflict=True
+            ), 409
+
         except Exception as exc:
-            return (jsonify(error='La población se cargó, pero no pudo guardarse en el trabajo persistente: ' + str(exc)), 500)
-    return jsonify(rows=int(len(df)), columns=list(df.columns), preview=df.head(10).fillna('').to_dict(orient='records'))
+            return jsonify(
+                error=(
+                    'La población se cargó, pero no pudo guardarse '
+                    'en el trabajo persistente: '
+                    + str(exc)
+                )
+            ), 500
+
+    return jsonify(
+        rows=int(row_count),
+        columns=columns,
+        preview=preview
+    )
+
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    p = get_project()
+    project = get_project()
     data = request.json or {}
-    df = p.get('df')
-    if df is None:
-        return (jsonify(error='Cargue primero una población'), 400)
+
     id_col = data.get('id') or data.get('id_col')
-    amount_col = data.get('amount') or data.get('amount_col')
+    amount_col = (
+        data.get('amount')
+        or data.get('amount_col')
+    )
+
     if not id_col or not amount_col:
-        return (jsonify(error='Debe definir las columnas ID e Importe'), 400)
-    p['mapping'] = {'id_col': id_col, 'amount_col': amount_col}
-    if p.get('work_code'):
-        try:
-            persist_project(p, 'Mapeo de población actualizado', {'id_col': id_col, 'amount_col': amount_col})
-        except WorkConflictError as exc:
-            return (jsonify(error=str(exc), conflict=True), 409)
-        except Exception as exc:
-            return (jsonify(error='El análisis se realizó, pero no pudo guardarse en el trabajo persistente: ' + str(exc)), 500)
-    return jsonify(population_analysis(df, amount_col))
+        return jsonify(
+            error='Debe definir las columnas ID e Importe'
+        ), 400
+
+    try:
+        if project.get('source_streaming'):
+            df = analysis_dataframe(
+                project,
+                id_col,
+                amount_col
+            )
+        else:
+            df = project.get('df')
+
+        if df is None:
+            return jsonify(
+                error='Cargue primero una población'
+            ), 400
+
+        if id_col not in df.columns:
+            return jsonify(
+                error='No se encuentra la columna ID seleccionada'
+            ), 400
+
+        if amount_col not in df.columns:
+            return jsonify(
+                error='No se encuentra la columna Importe seleccionada'
+            ), 400
+
+        project['mapping'] = {
+            'id_col': id_col,
+            'amount_col': amount_col
+        }
+
+        analysis = population_analysis(
+            df,
+            amount_col
+        )
+
+        project['analysis_cache'] = analysis
+        project['source_rows'] = int(len(df))
+
+        if project.get('work_code'):
+            persist_project(
+                project,
+                'Mapeo de población actualizado',
+                {
+                    'id_col': id_col,
+                    'amount_col': amount_col
+                }
+            )
+
+        return jsonify(analysis)
+
+    except WorkConflictError as exc:
+        return jsonify(
+            error=str(exc),
+            conflict=True
+        ), 409
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error=(
+                'No se pudo analizar la población: '
+                + str(exc)
+            )
+        ), 500
 
 @app.route('/api/calculate-sample', methods=['POST'])
 def calculate_sample():
@@ -682,64 +2030,274 @@ def calculate_sample():
     n, z, q = sample_size(N, confidence, error, p)
     return jsonify(n=n, z=z, q=q, formula='n=(Z²*p*q*N) / [e²*(N-1)+Z²*p*q]', variables={'N': N, 'Z': z, 'p': p, 'q': q, 'e': error})
 
+
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
-    p = get_project()
-    df = p.get('df')
-    d = request.json or {}
-    amount_col = d.get('amount_col')
-    if df is None or not amount_col:
-        return (jsonify(error='Defina una columna de importe'), 400)
-    a = population_analysis(df, amount_col)
-    reasons = []
-    if a.get('top20_pct', 0) >= 40:
-        reasons.append('Existe alta concentración monetaria: los 20 mayores importes explican al menos 40% del valor absoluto de la población.')
-    if a.get('outliers', 0) > 0:
-        reasons.append(f"Se detectaron {a['outliers']} valores atípicos por criterio de 3×IQR.")
-    threshold = float(d.get('significant_threshold') or 0)
-    significant = 0
-    if threshold > 0:
-        significant = int((parse_amount(df[amount_col]).abs() >= threshold).sum())
-    if significant:
-        reasons.append(f'Hay {significant} partidas iguales o superiores al umbral significativo.')
-    if significant or a.get('top20_pct', 0) >= 40:
-        method = 'stratified'
-        recommendation = 'Revisión 100% de partidas significativas + muestreo estratificado del universo residual'
-    elif a.get('std', 0) > abs(a.get('mean', 0)) and a.get('records', 0) > 30:
-        method = 'stratified'
-        recommendation = 'Muestreo estratificado'
-    else:
-        method = 'random'
-        recommendation = 'Muestreo aleatorio simple'
-    return jsonify(method=method, recommendation=recommendation, reasons=reasons or ['La población no presenta señales fuertes de concentración; un muestreo aleatorio simple es una alternativa razonable.'], analysis=a)
+    project = get_project()
+    data = request.json or {}
+
+    amount_col = data.get('amount_col')
+    id_col = (
+        project.get('mapping', {})
+        .get('id_col')
+    )
+
+    if not amount_col:
+        return jsonify(
+            error='Defina una columna de importe'
+        ), 400
+
+    try:
+        if project.get('source_streaming'):
+            df = analysis_dataframe(
+                project,
+                id_col,
+                amount_col
+            )
+        else:
+            df = project.get('df')
+
+        if df is None:
+            return jsonify(
+                error='Cargue primero una población'
+            ), 400
+
+        analysis = (
+            project.get('analysis_cache')
+            or population_analysis(
+                df,
+                amount_col
+            )
+        )
+
+        reasons = []
+
+        if analysis.get('top20_pct', 0) >= 40:
+            reasons.append(
+                'Existe alta concentración monetaria: '
+                'los 20 mayores importes explican al menos '
+                '40% del valor absoluto de la población.'
+            )
+
+        if analysis.get('outliers', 0) > 0:
+            reasons.append(
+                f"Se detectaron {analysis['outliers']} "
+                'valores atípicos por criterio de 3×IQR.'
+            )
+
+        threshold = float(
+            data.get('significant_threshold') or 0
+        )
+
+        significant = 0
+
+        if threshold > 0:
+            significant = int(
+                (
+                    parse_amount(
+                        df[amount_col]
+                    )
+                    .abs()
+                    >= threshold
+                ).sum()
+            )
+
+        if significant:
+            reasons.append(
+                f'Hay {significant} partidas iguales o '
+                'superiores al umbral significativo.'
+            )
+
+        if (
+            significant
+            or analysis.get('top20_pct', 0) >= 40
+        ):
+            method = 'stratified'
+            recommendation = (
+                'Revisión 100% de partidas significativas '
+                '+ muestreo estratificado del universo residual'
+            )
+
+        elif (
+            analysis.get('std', 0)
+            > abs(analysis.get('mean', 0))
+            and analysis.get('records', 0) > 30
+        ):
+            method = 'stratified'
+            recommendation = 'Muestreo estratificado'
+
+        else:
+            method = 'random'
+            recommendation = 'Muestreo aleatorio simple'
+
+        return jsonify(
+            method=method,
+            recommendation=recommendation,
+            reasons=(
+                reasons
+                or [
+                    'La población no presenta señales fuertes '
+                    'de concentración; un muestreo aleatorio '
+                    'simple es una alternativa razonable.'
+                ]
+            ),
+            analysis=analysis
+        )
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo generar la recomendación: ' + str(exc)
+        ), 500
+
 
 @app.route('/api/generate-sample', methods=['POST'])
 def generate_sample():
-    p = get_project()
-    df = p.get('df')
-    d = request.json or {}
-    if df is None:
-        return (jsonify(error='Cargue primero una población'), 400)
-    previous_params = p.get('params', {}).copy()
-    previous_signature = selection_signature(previous_params, previous_params.get('seed')) if previous_params else None
-    sample, seed = make_sample(df, d)
-    new_signature = selection_signature(d, seed)
-    p['sample'] = sample
-    p['params'] = d.copy()
-    p['params']['seed'] = seed
-    if previous_signature != new_signature:
-        p['audit_results'] = {}
-    amount_col = d.get('amount_col')
-    total = float(parse_amount(df[amount_col]).fillna(0).abs().sum()) if amount_col in df.columns else 0
-    selected = float(sample.get('_amount_numeric', pd.Series(dtype=float)).abs().sum()) if len(sample) else 0
-    if p.get('work_code'):
-        try:
-            persist_project(p, 'Muestra generada', {'selection_code': str(seed), 'method': d.get('method', ''), 'sample_rows': int(len(sample))})
-        except WorkConflictError as exc:
-            return (jsonify(error=str(exc), conflict=True), 409)
-        except Exception as exc:
-            return (jsonify(error='La muestra se generó, pero no pudo guardarse en el trabajo persistente: ' + str(exc)), 500)
-    return jsonify(rows=int(len(sample)), seed=seed, selection_code=str(seed), coverage_amount=selected / total * 100 if total else 0, coverage_count=len(sample) / len(df) * 100 if len(df) else 0, method=d.get('method', ''), preview=sample.drop(columns=['_amount_numeric'], errors='ignore').head(500).fillna('').to_dict(orient='records'))
+    project = get_project()
+    data = request.json or {}
+
+    id_col = data.get('id_col')
+    amount_col = data.get('amount_col')
+
+    try:
+        if project.get('source_streaming'):
+            df = analysis_dataframe(
+                project,
+                id_col,
+                amount_col
+            )
+        else:
+            df = project.get('df')
+
+        if df is None:
+            return jsonify(
+                error='Cargue primero una población'
+            ), 400
+
+        previous_params = (
+            project.get('params', {})
+            .copy()
+        )
+
+        previous_signature = (
+            selection_signature(
+                previous_params,
+                previous_params.get('seed')
+            )
+            if previous_params
+            else None
+        )
+
+        selected, seed = make_sample(
+            df,
+            data
+        )
+
+        if project.get('source_streaming'):
+            sample = hydrate_streaming_sample(
+                project,
+                selected
+            )
+        else:
+            sample = selected
+
+        new_signature = selection_signature(
+            data,
+            seed
+        )
+
+        project['sample'] = sample
+        project['params'] = data.copy()
+        project['params']['seed'] = seed
+
+        if previous_signature != new_signature:
+            project['audit_results'] = {}
+
+        total = (
+            float(
+                parse_amount(
+                    df[amount_col]
+                )
+                .fillna(0)
+                .abs()
+                .sum()
+            )
+            if amount_col in df.columns
+            else 0
+        )
+
+        selected_amount = (
+            float(
+                sample
+                .get(
+                    '_amount_numeric',
+                    pd.Series(dtype=float)
+                )
+                .abs()
+                .sum()
+            )
+            if len(sample)
+            else 0
+        )
+
+        if project.get('work_code'):
+            persist_project(
+                project,
+                'Muestra generada',
+                {
+                    'selection_code': str(seed),
+                    'method': data.get('method', ''),
+                    'sample_rows': int(len(sample))
+                },
+                save_sample=True
+            )
+
+        return jsonify(
+            rows=int(len(sample)),
+            seed=seed,
+            selection_code=str(seed),
+            coverage_amount=(
+                selected_amount / total * 100
+                if total
+                else 0
+            ),
+            coverage_count=(
+                len(sample) / len(df) * 100
+                if len(df)
+                else 0
+            ),
+            method=data.get('method', ''),
+            preview=(
+                sample
+                .drop(
+                    columns=['_amount_numeric'],
+                    errors='ignore'
+                )
+                .head(500)
+                .fillna('')
+                .to_dict(orient='records')
+            )
+        )
+
+    except WorkConflictError as exc:
+        return jsonify(
+            error=str(exc),
+            conflict=True
+        ), 409
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo generar la muestra: ' + str(exc)
+        ), 500
 
 @app.route('/api/sample', methods=['GET'])
 def sample_data():
@@ -903,50 +2461,245 @@ def extrapolation():
     except ValueError as e:
         return (jsonify(error=str(e)), 400)
 
+
 @app.route('/api/export', methods=['GET'])
 def export_excel():
-    p = get_project()
-    df = p.get('df')
-    sample = p.get('sample', pd.DataFrame())
-    if df is None:
-        return (jsonify(error='Sin población'), 400)
+    project = get_project()
+    sample = project.get('sample', pd.DataFrame())
+
+    has_population = (
+        project.get('df') is not None
+        or project.get('source_streaming')
+    )
+
+    if not has_population:
+        return jsonify(
+            error='Sin población'
+        ), 400
+
     out = BytesIO()
-    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='01_Poblacion_Original', index=False)
-        analysis = population_analysis(df, p.get('mapping', {}).get('amount_col'))
+
+    with pd.ExcelWriter(
+        out,
+        engine='xlsxwriter'
+    ) as writer:
+
+        if project.get('source_streaming'):
+            source_info = pd.DataFrame([
+                {
+                    'Archivo origen': project.get('source_name', ''),
+                    'Filas': int(project.get('source_rows') or 0),
+                    'Columnas': len(project.get('source_columns') or []),
+                    'Hash SHA-256': project.get('source_hash', ''),
+                    'Nota': (
+                        'La población original no se incrusta en este Excel '
+                        'por su tamaño. Se conserva la trazabilidad mediante '
+                        'nombre de archivo y hash SHA-256.'
+                    )
+                }
+            ])
+
+            source_info.to_excel(
+                writer,
+                sheet_name='01_Poblacion_Original',
+                index=False
+            )
+
+            analysis = (
+                project.get('analysis_cache')
+                or {}
+            )
+
+        else:
+            df = project.get('df')
+
+            df.to_excel(
+                writer,
+                sheet_name='01_Poblacion_Original',
+                index=False
+            )
+
+            analysis = (
+                project.get('analysis_cache')
+                or population_analysis(
+                    df,
+                    project
+                    .get('mapping', {})
+                    .get('amount_col')
+                )
+            )
+
         analysis_rows = []
+
         for key, value in analysis.items():
             if isinstance(value, dict):
                 for subkey, subvalue in value.items():
-                    analysis_rows.append([f'{key}.{subkey}', subvalue])
+                    analysis_rows.append(
+                        [f'{key}.{subkey}', subvalue]
+                    )
+
             elif isinstance(value, list):
-                analysis_rows.append([key, ', '.join((str(x) for x in value))])
+                analysis_rows.append(
+                    [
+                        key,
+                        ', '.join(
+                            str(item)
+                            for item in value
+                        )
+                    ]
+                )
+
             else:
-                analysis_rows.append([key, value])
-        pd.DataFrame(analysis_rows, columns=['Métrica', 'Valor']).to_excel(writer, sheet_name='02_Analisis_Poblacion', index=False)
-        params_rows = [['Código de selección' if key == 'seed' else key, value] for key, value in p.get('params', {}).items()]
-        pd.DataFrame(params_rows, columns=['Parámetro', 'Valor']).to_excel(writer, sheet_name='03_Parametros_Muestreo', index=False)
-        sample.drop(columns=['_amount_numeric'], errors='ignore').to_excel(writer, sheet_name='04_Muestra_Seleccionada', index=False)
-        pd.DataFrame(get_audit_rows(p)).to_excel(writer, sheet_name='05_Resultados_Auditoria', index=False)
+                analysis_rows.append(
+                    [key, value]
+                )
+
+        pd.DataFrame(
+            analysis_rows,
+            columns=['Métrica', 'Valor']
+        ).to_excel(
+            writer,
+            sheet_name='02_Analisis_Poblacion',
+            index=False
+        )
+
+        params_rows = [
+            [
+                'Código de selección'
+                if key == 'seed'
+                else key,
+                value
+            ]
+            for key, value
+            in project.get('params', {}).items()
+        ]
+
+        pd.DataFrame(
+            params_rows,
+            columns=['Parámetro', 'Valor']
+        ).to_excel(
+            writer,
+            sheet_name='03_Parametros_Muestreo',
+            index=False
+        )
+
+        sample.drop(
+            columns=['_amount_numeric'],
+            errors='ignore'
+        ).to_excel(
+            writer,
+            sheet_name='04_Muestra_Seleccionada',
+            index=False
+        )
+
+        pd.DataFrame(
+            get_audit_rows(project)
+        ).to_excel(
+            writer,
+            sheet_name='05_Resultados_Auditoria',
+            index=False
+        )
+
         try:
-            extra = calculate_extrapolation(p)
+            extra = calculate_extrapolation(
+                project
+            )
+
             extra_rows = []
+
             for key, value in extra.items():
                 if isinstance(value, dict):
                     for subkey, subvalue in value.items():
-                        extra_rows.append([f'{key}.{subkey}', subvalue])
+                        extra_rows.append(
+                            [
+                                f'{key}.{subkey}',
+                                subvalue
+                            ]
+                        )
+
                 else:
-                    extra_rows.append([key, value])
-            pd.DataFrame(extra_rows, columns=['Métrica', 'Valor']).to_excel(writer, sheet_name='06_Extrapolacion', index=False)
+                    extra_rows.append(
+                        [key, value]
+                    )
+
+            pd.DataFrame(
+                extra_rows,
+                columns=['Métrica', 'Valor']
+            ).to_excel(
+                writer,
+                sheet_name='06_Extrapolacion',
+                index=False
+            )
+
         except Exception:
-            pd.DataFrame([{'Estado': 'Pendiente de resultados'}]).to_excel(writer, sheet_name='06_Extrapolacion', index=False)
-        summary = pd.DataFrame([{'Código de trabajo': p.get('work_code', ''), 'Nombre del trabajo': p.get('work_name', ''), 'Responsable': p.get('responsible', ''), 'Proyecto': p.get('source_name', ''), 'Fecha': datetime.now().isoformat(), 'Población': len(df), 'Muestra': len(sample), 'Código de selección': p.get('params', {}).get('seed', ''), 'Hash archivo original': p.get('source_hash', '')}])
-        summary.to_excel(writer, sheet_name='07_Resumen_Ejecutivo', index=False)
-        for ws in writer.sheets.values():
-            ws.freeze_panes(1, 0)
-            ws.set_column(0, min(30, ws.dim_colmax + 1), 18)
+            pd.DataFrame([
+                {
+                    'Estado':
+                        'Pendiente de resultados'
+                }
+            ]).to_excel(
+                writer,
+                sheet_name='06_Extrapolacion',
+                index=False
+            )
+
+        summary = pd.DataFrame([
+            {
+                'Código de trabajo': project.get('work_code', ''),
+                'Nombre del trabajo': project.get('work_name', ''),
+                'Responsable': project.get('responsible', ''),
+                'Proyecto': project.get('source_name', ''),
+                'Fecha': datetime.now().isoformat(),
+                'Población': int(
+                    project.get('source_rows')
+                    or (
+                        len(project.get('df'))
+                        if project.get('df') is not None
+                        else 0
+                    )
+                ),
+                'Muestra': len(sample),
+                'Código de selección': (
+                    project
+                    .get('params', {})
+                    .get('seed', '')
+                ),
+                'Hash archivo original': project.get('source_hash', '')
+            }
+        ])
+
+        summary.to_excel(
+            writer,
+            sheet_name='07_Resumen_Ejecutivo',
+            index=False
+        )
+
+        for worksheet in writer.sheets.values():
+            worksheet.freeze_panes(1, 0)
+
+            max_col = min(
+                30,
+                max(
+                    0,
+                    worksheet.dim_colmax
+                )
+            )
+
+            worksheet.set_column(
+                0,
+                max_col,
+                18
+            )
+
     out.seek(0)
-    return send_file(out, as_attachment=True, download_name='Audit_Sampling_Export.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+    return send_file(
+        out,
+        as_attachment=True,
+        download_name='Audit_Sampling_Export.xlsx',
+        mimetype=(
+            'application/vnd.openxmlformats-officedocument.'
+            'spreadsheetml.sheet'
+        )
+    )
+
