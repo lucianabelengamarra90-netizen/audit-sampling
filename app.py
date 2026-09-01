@@ -620,13 +620,25 @@ def upload():
     f.save(path)
     try:
         ext = name.rsplit('.', 1)[1].lower()
-        if ext == 'csv':
-            try:
-                df = pd.read_csv(path, low_memory=False)
-            except UnicodeDecodeError:
-                df = pd.read_csv(path, low_memory=False, encoding='latin1')
-        else:
-            df = pd.read_excel(path, engine='pyxlsb' if ext == 'xlsb' else None)
+       if ext == 'csv':
+    try:
+        df = pd.read_csv(
+            path,
+            sep=';',
+            low_memory=False
+        )
+    except UnicodeDecodeError:
+        df = pd.read_csv(
+            path,
+            sep=';',
+            low_memory=False,
+            encoding='latin1'
+        )
+else:
+    df = pd.read_excel(
+        path,
+        engine='pyxlsb' if ext == 'xlsb' else None
+    )
     except Exception as e:
         return (jsonify(error='No se pudo leer el archivo: ' + str(e)), 400)
     df.columns = [str(c).strip() for c in df.columns]
