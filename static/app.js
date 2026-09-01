@@ -1,5016 +1,3161 @@
-// =========================================================
-// AUDIT SAMPLING & EXTRAPOLATION - FRONTEND
-// =========================================================
+import os, uuid, math, hashlib, json, gzip, secrets, pickle, csv
+from datetime import datetime
+from io import BytesIO, StringIO
+import numpy as np
+import pandas as pd
+from flask import Flask, render_template, request, jsonify, send_file, session
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+from werkzeug.security import generate_password_hash, check_password_hash
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'audit-secret-key-change-in-production')
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'xlsb'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+projects = {}
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
-let population = null;
-let mapping = {};
-let sample = [];
-let results = {};
-let lastSelectionCode = null;
-let currentWork = null;
-// =========================================================
-// LECTURA SEGURA DE RESPUESTAS JSON
-// =========================================================
+class WorkConflictError(Exception):
+    pass
 
-async function readJsonResponse(response) {
+def database_available():
+    return bool(DATABASE_URL)
 
-    const text = await response.text();
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError('DATABASE_URL no está configurada.')
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
-    if (!text) {
-        throw new Error(
-            "El servidor cerró la conexión sin devolver respuesta."
-        );
+def json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+def json_dumps(value):
+    return json.dumps(value, ensure_ascii=False, default=json_default)
+
+def df_to_blob(df):
+    if df is None:
+        return None
+
+    buffer = BytesIO()
+    buffer.write(b'PKL1')
+
+    with gzip.GzipFile(
+        fileobj=buffer,
+        mode='wb',
+        compresslevel=1
+    ) as gz:
+        pickle.dump(
+            df,
+            gz,
+            protocol=pickle.HIGHEST_PROTOCOL
+        )
+
+    return psycopg2.Binary(buffer.getvalue())
+
+
+def blob_to_df(blob):
+    if blob is None:
+        return None
+
+    raw = bytes(blob)
+
+    if not raw:
+        return pd.DataFrame()
+
+    if raw.startswith(b'PKL1'):
+        buffer = BytesIO(raw)
+        buffer.seek(4)
+
+        with gzip.GzipFile(
+            fileobj=buffer,
+            mode='rb'
+        ) as gz:
+            return pickle.load(gz)
+
+    text = gzip.decompress(raw).decode('utf-8')
+
+    return pd.read_json(
+        StringIO(text),
+        orient='split'
+    )
+
+
+def init_db():
+    if not database_available():
+        print('DATABASE_URL no configurada: tracking persistente deshabilitado.')
+        return
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE SEQUENCE IF NOT EXISTS audit_work_seq START 1;
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_projects (
+                    work_code VARCHAR(40) PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    responsible TEXT NOT NULL,
+                    access_key_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'En curso',
+                    source_name TEXT,
+                    source_hash TEXT,
+                    mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    params JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    audit_results JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    population_blob BYTEA,
+                    sample_blob BYTEA,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+            """)
+
+            # Metadatos adicionales para poblaciones grandes procesadas en modo streaming.
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_rows BIGINT DEFAULT 0;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_columns JSONB NOT NULL DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_preview JSONB NOT NULL DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_ext TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_encoding TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_separator TEXT;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS source_streaming BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE audit_projects ADD COLUMN IF NOT EXISTS analysis_cache JSONB NOT NULL DEFAULT '{}'::jsonb;")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_project_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    work_code VARCHAR(40) NOT NULL
+                        REFERENCES audit_projects(work_code)
+                        ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_projects_updated
+                ON audit_projects(updated_at DESC);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_events_work
+                ON audit_project_events(work_code, created_at DESC);
+            """)
+
+        conn.commit()
+
+def log_event_with_cursor(cur, project, event_type, details=None):
+    work_code = project.get('work_code')
+    if not work_code:
+        return
+    cur.execute('\n        INSERT INTO audit_project_events\n            (work_code, event_type, actor, details)\n        VALUES\n            (%s, %s, %s, %s)\n        ', (work_code, event_type, project.get('responsible', ''), Json(details or {}, dumps=json_dumps)))
+
+def log_event(project, event_type, details=None):
+    if not database_available() or not project.get('work_code'):
+        return
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            log_event_with_cursor(cur, project, event_type, details)
+        conn.commit()
+
+def fetch_work_record(work_code):
+    if not database_available():
+        return None
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('\n                SELECT *\n                FROM audit_projects\n                WHERE UPPER(work_code) = UPPER(%s)\n                ', (work_code.strip(),))
+            return cur.fetchone()
+
+
+def record_to_project(row):
+    source_streaming = bool(row.get('source_streaming'))
+
+    return {
+        'df': blob_to_df(row['population_blob']) if row.get('population_blob') is not None else None,
+        'analysis_df': None,
+        'analysis_mapping': None,
+        'analysis_raw_rows': int(
+            (row.get('analysis_cache') or {}).get('source_rows_raw', 0)
+        ),
+        'analysis_missing_ids': int(
+            (row.get('analysis_cache') or {}).get('missing_id_rows', 0)
+        ),
+        'mapping': row['mapping'] or {},
+        'sample': blob_to_df(row['sample_blob']) if row.get('sample_blob') is not None else pd.DataFrame(),
+        'params': row['params'] or {},
+        'audit_results': row['audit_results'] or {},
+        'analysis_cache': row.get('analysis_cache') or {},
+        'created': row['created_at'].isoformat() if row.get('created_at') else datetime.now().isoformat(),
+        'source_name': row.get('source_name') or '',
+        'source_hash': row.get('source_hash') or '',
+        'source_path': '',
+        'source_ext': row.get('source_ext') or '',
+        'source_encoding': row.get('source_encoding') or '',
+        'source_separator': row.get('source_separator') or '',
+        'source_rows': int(row.get('source_rows') or 0),
+        'source_columns': row.get('source_columns') or [],
+        'source_preview': row.get('source_preview') or [],
+        'source_streaming': source_streaming,
+        'work_code': row['work_code'],
+        'work_name': row['name'],
+        'responsible': row['responsible'],
+        'work_status': row.get('status') or 'En curso',
+        'db_version': int(row.get('version') or 1)
     }
 
-    try {
-        return JSON.parse(text);
-    } catch (error) {
 
-        console.error(
-            "Respuesta recibida del servidor:",
-            text
-        );
+def persist_project(
+    project,
+    event_type='Guardado',
+    details=None,
+    save_population=False,
+    save_sample=False
+):
+    """
+    Guarda el expediente sin volver a serializar la población completa
+    en cada acción. La población solo se escribe cuando realmente cambia.
+    """
+    work_code = project.get('work_code')
 
-        throw new Error(
-            "Error del servidor (HTTP " +
-            response.status +
-            "). Revisar los logs de Render."
-        );
+    if not work_code:
+        return False
+
+    if not database_available():
+        raise RuntimeError(
+            'La base de datos no está disponible. '
+            'El trabajo no pudo guardarse de forma persistente.'
+        )
+
+    expected_version = int(project.get('db_version', 1) or 1)
+
+    population_blob = (
+        df_to_blob(project.get('df'))
+        if save_population
+        else None
+    )
+
+    sample_blob = (
+        df_to_blob(project.get('sample', pd.DataFrame()))
+        if save_sample
+        else None
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE audit_projects
+                SET
+                    name = %s,
+                    responsible = %s,
+                    status = %s,
+                    source_name = %s,
+                    source_hash = %s,
+                    mapping = %s,
+                    params = %s,
+                    audit_results = %s,
+                    source_rows = %s,
+                    source_columns = %s,
+                    source_preview = %s,
+                    source_ext = %s,
+                    source_encoding = %s,
+                    source_separator = %s,
+                    source_streaming = %s,
+                    analysis_cache = %s,
+                    population_blob =
+                        CASE WHEN %s THEN %s ELSE population_blob END,
+                    sample_blob =
+                        CASE WHEN %s THEN %s ELSE sample_blob END,
+                    updated_at = NOW(),
+                    version = version + 1
+                WHERE
+                    work_code = %s
+                    AND version = %s
+                RETURNING version
+            """, (
+                project.get('work_name') or 'Trabajo de auditoría',
+                project.get('responsible') or '',
+                project.get('work_status') or 'En curso',
+                project.get('source_name') or '',
+                project.get('source_hash') or '',
+                Json(project.get('mapping') or {}, dumps=json_dumps),
+                Json(project.get('params') or {}, dumps=json_dumps),
+                Json(project.get('audit_results') or {}, dumps=json_dumps),
+                int(project.get('source_rows') or 0),
+                Json(project.get('source_columns') or [], dumps=json_dumps),
+                Json(project.get('source_preview') or [], dumps=json_dumps),
+                project.get('source_ext') or '',
+                project.get('source_encoding') or '',
+                project.get('source_separator') or '',
+                bool(project.get('source_streaming')),
+                Json(project.get('analysis_cache') or {}, dumps=json_dumps),
+                bool(save_population),
+                population_blob,
+                bool(save_sample),
+                sample_blob,
+                work_code,
+                expected_version
+            ))
+
+            updated = cur.fetchone()
+
+            if not updated:
+                conn.rollback()
+                raise WorkConflictError(
+                    'Este trabajo fue modificado desde otra sesión. '
+                    'Volvé a abrirlo antes de guardar para evitar sobrescribir cambios.'
+                )
+
+            project['db_version'] = int(updated[0])
+            log_event_with_cursor(cur, project, event_type, details or {})
+
+        conn.commit()
+
+    return True
+
+
+def create_persistent_work(project, name, responsible):
+    if not database_available():
+        raise RuntimeError('La conexión a PostgreSQL no está disponible.')
+
+    name = (name or '').strip()
+    responsible = (responsible or '').strip()
+
+    if not name:
+        raise ValueError('Ingresá un nombre para el trabajo.')
+
+    if not responsible:
+        raise ValueError('Ingresá el responsable del trabajo.')
+
+    alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    access_key = ''.join(secrets.choice(alphabet) for _ in range(8))
+    access_key_hash = generate_password_hash(access_key)
+
+    population_blob = (
+        None
+        if project.get('source_streaming')
+        else df_to_blob(project.get('df'))
+    )
+
+    sample_blob = df_to_blob(
+        project.get('sample', pd.DataFrame())
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT nextval('audit_work_seq')")
+            sequence_number = int(cur.fetchone()[0])
+
+            work_code = (
+                f'AUD-{datetime.now().year}-{sequence_number:06d}'
+            )
+
+            cur.execute("""
+                INSERT INTO audit_projects (
+                    work_code,
+                    name,
+                    responsible,
+                    access_key_hash,
+                    status,
+                    source_name,
+                    source_hash,
+                    mapping,
+                    params,
+                    audit_results,
+                    population_blob,
+                    sample_blob,
+                    source_rows,
+                    source_columns,
+                    source_preview,
+                    source_ext,
+                    source_encoding,
+                    source_separator,
+                    source_streaming,
+                    analysis_cache,
+                    version
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, 1
+                )
+            """, (
+                work_code,
+                name,
+                responsible,
+                access_key_hash,
+                'En curso',
+                project.get('source_name') or '',
+                project.get('source_hash') or '',
+                Json(project.get('mapping') or {}, dumps=json_dumps),
+                Json(project.get('params') or {}, dumps=json_dumps),
+                Json(project.get('audit_results') or {}, dumps=json_dumps),
+                population_blob,
+                sample_blob,
+                int(project.get('source_rows') or 0),
+                Json(project.get('source_columns') or [], dumps=json_dumps),
+                Json(project.get('source_preview') or [], dumps=json_dumps),
+                project.get('source_ext') or '',
+                project.get('source_encoding') or '',
+                project.get('source_separator') or '',
+                bool(project.get('source_streaming')),
+                Json(project.get('analysis_cache') or {}, dumps=json_dumps)
+            ))
+
+            project['work_code'] = work_code
+            project['work_name'] = name
+            project['responsible'] = responsible
+            project['work_status'] = 'En curso'
+            project['db_version'] = 1
+
+            log_event_with_cursor(
+                cur,
+                project,
+                'Trabajo creado',
+                {
+                    'name': name,
+                    'responsible': responsible
+                }
+            )
+
+        conn.commit()
+
+    return work_code, access_key
+
+
+def new_temp_project():
+    return {
+        'df': None,
+        'analysis_df': None,
+        'analysis_mapping': None,
+        'analysis_raw_rows': 0,
+        'analysis_missing_ids': 0,
+        'mapping': {},
+        'sample': pd.DataFrame(),
+        'params': {},
+        'audit_results': {},
+        'analysis_cache': {},
+        'created': datetime.now().isoformat(),
+        'source_name': '',
+        'source_hash': '',
+        'source_path': '',
+        'source_ext': '',
+        'source_encoding': '',
+        'source_separator': '',
+        'source_rows': 0,
+        'source_columns': [],
+        'source_preview': [],
+        'source_streaming': False,
+        'work_code': '',
+        'work_name': '',
+        'responsible': '',
+        'work_status': 'Temporal',
+        'db_version': None
     }
-}
-
-// =========================================================
-// NAVEGACIÓN
-// =========================================================
-
-document.querySelectorAll(".nav-tab").forEach(tab => {
-
-    tab.onclick = () => {
-
-        document
-            .querySelectorAll(".nav-tab")
-            .forEach(x => x.classList.remove("active"));
-
-        document
-            .querySelectorAll(".tab-content")
-            .forEach(x => x.classList.remove("active"));
-
-        tab.classList.add("active");
-
-        document
-            .getElementById(tab.dataset.tab)
-            .classList.add("active");
-    };
-});
 
 
-// =========================================================
-// ELEMENTOS PRINCIPALES
-// =========================================================
-
-const drop = document.getElementById("drop");
-const file = document.getElementById("file");
-const msg = document.getElementById("msg");
-const mappingCard = document.getElementById("mappingCard");
-const mappingDiv = document.getElementById("mapping");
-const analyze = document.getElementById("analyze");
-const preview = document.getElementById("preview");
-const popKpis = document.getElementById("popKpis");
-const quality = document.getElementById("quality");
+def allowed_file(name):
+    return (
+        '.' in name
+        and name.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    )
 
 
-// =========================================================
-// TRACKING DE TRABAJOS
-// =========================================================
+def compute_file_hash(path, chunk_size=4 * 1024 * 1024):
+    hasher = hashlib.sha256()
 
-async function initializeWorkTracking() {
+    with open(path, 'rb') as handle:
+        for chunk in iter(
+            lambda: handle.read(chunk_size),
+            b''
+        ):
+            hasher.update(chunk)
 
-    await checkDatabaseStatus();
+    return hasher.hexdigest()
 
-    try {
 
-        const r = await fetch("/api/work/current");
-        const state = await r.json();
+def detect_csv_format(path):
+    """
+    Detecta codificación y separador sin cargar el archivo completo.
+    Prioriza ; porque es el formato más habitual de los CSV regionales,
+    pero también acepta coma, tab y |.
+    """
+    encodings = ('utf-8-sig', 'utf-8', 'latin1')
 
-        if (!r.ok || state.error) {
-            showWorkMessage(
-                state.error || "No se pudo recuperar el trabajo actual.",
-                "error"
-            );
-            return;
+    for encoding in encodings:
+        try:
+            with open(
+                path,
+                'r',
+                encoding=encoding,
+                newline=''
+            ) as handle:
+                sample = handle.read(65536)
+
+            if not sample:
+                return encoding, ';'
+
+            try:
+                dialect = csv.Sniffer().sniff(
+                    sample,
+                    delimiters=';,\t|'
+                )
+                separator = dialect.delimiter
+            except csv.Error:
+                counts = {
+                    ';': sample.count(';'),
+                    ',': sample.count(','),
+                    '\t': sample.count('\t'),
+                    '|': sample.count('|')
+                }
+                separator = max(
+                    counts,
+                    key=counts.get
+                )
+
+            # Valida que pandas pueda leer al menos algunas filas.
+            pd.read_csv(
+                path,
+                sep=separator,
+                encoding=encoding,
+                nrows=5,
+                low_memory=True
+            )
+
+            return encoding, separator
+
+        except UnicodeDecodeError:
+            continue
+
+    return 'latin1', ';'
+
+
+def read_csv_metadata(path):
+    encoding, separator = detect_csv_format(path)
+
+    preview_df = pd.read_csv(
+        path,
+        sep=separator,
+        encoding=encoding,
+        nrows=10,
+        low_memory=True
+    )
+
+    preview_df.columns = [
+        str(column).strip()
+        for column in preview_df.columns
+    ]
+
+    rows = 0
+
+    # Cuenta registros leyendo solamente la primera columna.
+    for chunk in pd.read_csv(
+        path,
+        sep=separator,
+        encoding=encoding,
+        usecols=[0],
+        chunksize=100000,
+        low_memory=True
+    ):
+        rows += len(chunk)
+
+    return (
+        preview_df,
+        rows,
+        encoding,
+        separator
+    )
+
+
+def normalize_id_series(series):
+    """
+    Normaliza el ID elegido por el usuario.
+    Los IDs vacíos se excluyen porque no permiten identificar
+    de forma reproducible una unidad de muestreo.
+    """
+    normalized = (
+        series
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+
+    invalid = (
+        normalized.eq("")
+        | normalized.str.lower().isin(
+            {"nan", "none", "nat", "<na>"}
+        )
+    )
+
+    return normalized.mask(invalid)
+
+
+def analysis_dataframe(project, id_col=None, amount_col=None):
+    """
+    Construye el universo de muestreo a partir de la combinación
+    ID + Importe elegida por el usuario.
+
+    Una combinación ID + Importe repetida muchas veces en el archivo
+    se considera UN SOLO registro para el muestreo.
+
+    Se conserva además la primera fila física de origen para poder
+    recuperar correctamente todos los demás campos al generar la muestra.
+    """
+    id_col = str(id_col or "").strip()
+    amount_col = str(amount_col or "").strip()
+
+    if not id_col or not amount_col:
+        raise ValueError(
+            "Debe definir las columnas ID e Importe."
+        )
+
+    if id_col == amount_col:
+        raise ValueError(
+            "La columna ID y la columna Importe deben ser diferentes."
+        )
+
+    cached = project.get("analysis_df")
+    cached_mapping = project.get("analysis_mapping")
+
+    if (
+        cached is not None
+        and cached_mapping == (id_col, amount_col)
+        and id_col in cached.columns
+        and amount_col in cached.columns
+    ):
+        return cached
+
+    representative_parts = []
+    count_parts = []
+
+    source_rows_raw = 0
+    missing_id_rows = 0
+    offset = 0
+
+    def process_part(frame, base_offset):
+        nonlocal source_rows_raw, missing_id_rows
+
+        frame = frame.copy()
+
+        frame.columns = [
+            str(column).strip()
+            for column in frame.columns
+        ]
+
+        if id_col not in frame.columns:
+            raise ValueError(
+                "No se encuentra la columna ID seleccionada."
+            )
+
+        if amount_col not in frame.columns:
+            raise ValueError(
+                "No se encuentra la columna Importe seleccionada."
+            )
+
+        row_count = len(frame)
+        source_rows_raw += row_count
+
+        ids = normalize_id_series(
+            frame[id_col]
+        )
+
+        amounts = parse_amount(
+            frame[amount_col]
+        )
+
+        valid_id = ids.notna()
+        missing_id_rows += int((~valid_id).sum())
+
+        if not valid_id.any():
+            return
+
+        positions = (
+            base_offset
+            + np.arange(
+                row_count,
+                dtype=np.int64
+            )
+        )
+
+        work = pd.DataFrame(
+            {
+                id_col: ids.to_numpy(),
+                amount_col: amounts.to_numpy(),
+                "_source_index": positions
+            }
+        )
+
+        work = work.loc[
+            valid_id.to_numpy()
+        ].copy()
+
+        # Un representante por combinación ID + importe dentro del bloque.
+        representatives = (
+            work
+            .drop_duplicates(
+                subset=[id_col, amount_col],
+                keep="first"
+            )
+            [[id_col, amount_col, "_source_index"]]
+        )
+
+        representative_parts.append(
+            representatives
+        )
+
+        # Cantidad de filas físicas que originaron cada combinación.
+        counts = (
+            work
+            .groupby(
+                [id_col, amount_col],
+                sort=False,
+                dropna=False
+            )
+            .size()
+            .rename("_source_row_count")
+            .reset_index()
+        )
+
+        count_parts.append(
+            counts
+        )
+
+    if project.get("source_streaming"):
+        path = project.get("source_path")
+
+        if not path or not os.path.exists(path):
+            raise ValueError(
+                "La población original ya no está disponible en el servidor. "
+                "Volvé a cargar el archivo fuente para continuar."
+            )
+
+        wanted = {
+            id_col,
+            amount_col
         }
 
-        renderWorkState(state);
+        reader = pd.read_csv(
+            path,
+            sep=project.get("source_separator") or ";",
+            encoding=project.get("source_encoding") or "utf-8",
+            usecols=lambda column:
+                str(column).strip() in wanted,
+            chunksize=100000,
+            low_memory=True
+        )
+
+        for chunk in reader:
+            process_part(
+                chunk,
+                offset
+            )
+
+            offset += len(chunk)
+
+    else:
+        source = project.get("df")
+
+        if source is None:
+            raise ValueError(
+                "Cargue primero una población."
+            )
+
+        process_part(
+            source[[id_col, amount_col]],
+            0
+        )
+
+    if not representative_parts:
+        raise ValueError(
+            "No se encontraron IDs válidos para construir la población."
+        )
+
+    # Quita también duplicados que hayan quedado repartidos
+    # entre distintos bloques del CSV.
+    representatives = (
+        pd.concat(
+            representative_parts,
+            ignore_index=True
+        )
+        .drop_duplicates(
+            subset=[id_col, amount_col],
+            keep="first"
+        )
+        .reset_index(drop=True)
+    )
+
+    counts = (
+        pd.concat(
+            count_parts,
+            ignore_index=True
+        )
+        .groupby(
+            [id_col, amount_col],
+            sort=False,
+            dropna=False
+        )["_source_row_count"]
+        .sum()
+        .reset_index()
+    )
+
+    universe = representatives.merge(
+        counts,
+        on=[id_col, amount_col],
+        how="left",
+        sort=False
+    )
+
+    universe[id_col] = (
+        universe[id_col]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+
+    universe[amount_col] = pd.to_numeric(
+        universe[amount_col],
+        errors="coerce"
+    )
+
+    universe["_source_index"] = (
+        universe["_source_index"]
+        .astype("int64")
+    )
+
+    universe["_source_row_count"] = (
+        universe["_source_row_count"]
+        .fillna(1)
+        .astype("int64")
+    )
+
+    universe = universe.reset_index(
+        drop=True
+    )
+
+    project["analysis_df"] = universe
+    project["analysis_mapping"] = (
+        id_col,
+        amount_col
+    )
+
+    project["analysis_raw_rows"] = int(
+        source_rows_raw
+    )
+
+    project["analysis_missing_ids"] = int(
+        missing_id_rows
+    )
+
+    project["source_rows"] = int(
+        len(universe)
+    )
+
+    return universe
+
+def hydrate_streaming_sample(project, selected):
+    """
+    Recupera exactamente la fila física representativa de cada
+    registro único ID + Importe seleccionado.
+
+    La selección estadística se realiza sobre el universo deduplicado,
+    mientras que la salida conserva todos los campos originales.
+    """
+    if selected is None or selected.empty:
+        return pd.DataFrame()
+
+    if "_source_index" not in selected.columns:
+        raise ValueError(
+            "La muestra no contiene la referencia a la fila de origen."
+        )
+
+    source_indices = (
+        selected["_source_index"]
+        .astype(int)
+        .to_numpy()
+    )
+
+    wanted_indices = set(
+        source_indices.tolist()
+    )
+
+    source_pieces = []
+
+    if project.get("source_streaming"):
+        path = project.get("source_path")
+
+        if not path or not os.path.exists(path):
+            raise ValueError(
+                "La población original ya no está disponible en el servidor. "
+                "Volvé a cargar el archivo fuente para generar la muestra."
+            )
+
+        offset = 0
+
+        reader = pd.read_csv(
+            path,
+            sep=project.get("source_separator") or ";",
+            encoding=project.get("source_encoding") or "utf-8",
+            chunksize=25000,
+            low_memory=True
+        )
+
+        remaining = set(
+            wanted_indices
+        )
+
+        for chunk in reader:
+            chunk.columns = [
+                str(column).strip()
+                for column in chunk.columns
+            ]
+
+            start = offset
+            stop = offset + len(chunk)
+
+            local_indices = [
+                index
+                for index in remaining
+                if start <= index < stop
+            ]
+
+            if local_indices:
+                positions = (
+                    np.array(
+                        local_indices,
+                        dtype=np.int64
+                    )
+                    - start
+                )
+
+                part = chunk.iloc[
+                    positions
+                ].copy()
+
+                part["_source_index"] = np.array(
+                    local_indices,
+                    dtype=np.int64
+                )
+
+                source_pieces.append(
+                    part
+                )
+
+                remaining.difference_update(
+                    local_indices
+                )
+
+                if not remaining:
+                    break
+
+            offset = stop
+
+    else:
+        source = project.get("df")
+
+        if source is None:
+            raise ValueError(
+                "La población original no está disponible."
+            )
+
+        valid_positions = [
+            index
+            for index in source_indices
+            if 0 <= index < len(source)
+        ]
+
+        if valid_positions:
+            part = source.iloc[
+                valid_positions
+            ].copy()
+
+            part["_source_index"] = np.array(
+                valid_positions,
+                dtype=np.int64
+            )
+
+            source_pieces.append(
+                part
+            )
+
+    if source_pieces:
+        source_rows = pd.concat(
+            source_pieces,
+            ignore_index=True
+        )
+    else:
+        source_rows = pd.DataFrame(
+            {
+                "_source_index":
+                    source_indices
+            }
+        )
+
+    meta_columns = [
+        "_source_index",
+        "_original_index",
+        "_amount_numeric",
+        "_source_row_count",
+        "Motivo de selección",
+        "Método",
+        "Tipo_Seleccion",
+        "Estrato"
+    ]
+
+    meta = selected[
+        [
+            column
+            for column in meta_columns
+            if column in selected.columns
+        ]
+    ].copy()
+
+    meta["_selection_order"] = np.arange(
+        len(meta),
+        dtype=np.int64
+    )
+
+    sample = source_rows.merge(
+        meta,
+        on="_source_index",
+        how="right",
+        sort=False
+    )
+
+    # Si el monto de origen fue leído como texto, _amount_numeric
+    # conserva exactamente el valor monetario usado en el muestreo.
+    mapping = project.get("mapping") or {}
+    params = project.get("params") or {}
+
+    amount_col = (
+        params.get("amount_col")
+        or mapping.get("amount_col")
+    )
+
+    if (
+        amount_col
+        and amount_col in sample.columns
+        and "_amount_numeric" in sample.columns
+    ):
+        sample[amount_col] = (
+            sample["_amount_numeric"]
+        )
+
+    sample = (
+        sample
+        .sort_values("_selection_order")
+        .drop(
+            columns=["_selection_order"],
+            errors="ignore"
+        )
+        .reset_index(drop=True)
+    )
+
+    return sample
+
+def get_project():
+    pid = session.get('project_id')
+    if pid and pid in projects:
+        return projects[pid]
+    work_code = session.get('work_code')
+    if work_code and database_available():
+        try:
+            row = fetch_work_record(work_code)
+            if row:
+                project = record_to_project(row)
+                pid = str(uuid.uuid4())
+                projects[pid] = project
+                session['project_id'] = pid
+                return project
+        except Exception as exc:
+            print('No se pudo restaurar el trabajo desde PostgreSQL:', exc)
+    pid = str(uuid.uuid4())
+    projects[pid] = new_temp_project()
+    session['project_id'] = pid
+    return projects[pid]
+
+
+def project_state_payload(project):
+    df = project.get('df')
+    sample = project.get('sample', pd.DataFrame())
+    mapping = project.get('mapping') or {}
+    params = project.get('params') or {}
+
+    population_state = None
+
+    if project.get('source_streaming'):
+        if project.get('source_rows') or project.get('source_columns'):
+            population_state = {
+                'rows': int(project.get('source_rows') or 0),
+                'columns': project.get('source_columns') or [],
+                'preview': project.get('source_preview') or [],
+                'analysis': project.get('analysis_cache') or None
+            }
+
+    elif df is not None:
+        amount_col = mapping.get('amount_col')
+
+        analysis = project.get('analysis_cache') or None
 
         if (
-            state.population ||
-            (state.sample && state.sample.rows)
-        ) {
-            await restoreProjectState(state);
-        }
-
-    } catch (err) {
-
-        showWorkMessage(
-            "No se pudo consultar el estado del trabajo: " + err.message,
-            "error"
-        );
-    }
-}
-
-
-async function checkDatabaseStatus() {
-
-    const badge = document.getElementById("dbStatus");
-
-    if (!badge) return;
-
-    try {
-
-        const r = await fetch("/api/work/db-status");
-        const j = await r.json();
-
-        if (j.available) {
-
-            badge.textContent = "BASE DISPONIBLE";
-
-            badge.style.background = "#e9f7ef";
-            badge.style.color = "#207544";
-
-        } else {
-
-            badge.textContent = "BASE NO DISPONIBLE";
-
-            badge.style.background = "#fdecec";
-            badge.style.color = "#a73030";
-
-            if (j.message) {
-                showWorkMessage(j.message, "error");
-            }
-        }
-
-    } catch (err) {
-
-        badge.textContent = "BASE NO DISPONIBLE";
-
-        badge.style.background = "#fdecec";
-        badge.style.color = "#a73030";
-    }
-}
-
-
-function renderWorkState(state) {
-
-    const work =
-        state && state.work
-            ? state.work
-            : {};
-
-    currentWork = work;
-
-    const noActive =
-        document.getElementById("workNoActive");
-
-    const active =
-        document.getElementById("workActive");
-
-
-    if (work.work_code) {
-
-        if (noActive) {
-            noActive.style.display = "none";
-        }
-
-        if (active) {
-            active.style.display = "block";
-        }
-
-        document.getElementById("currentWorkCode").textContent =
-            work.work_code || "-";
-
-        document.getElementById("currentWorkName").textContent =
-            work.name || "-";
-
-        document.getElementById("currentWorkResponsible").textContent =
-            work.responsible || "-";
-
-        document.getElementById("currentWorkStatus").textContent =
-            work.status || "En curso";
-
-    } else {
-
-        if (noActive) {
-            noActive.style.display = "block";
-        }
-
-        if (active) {
-            active.style.display = "none";
-        }
-    }
-}
-
-
-function showWorkMessage(text, type = "info") {
-
-    const box =
-        document.getElementById("workMessage");
-
-    if (!box) return;
-
-    if (!text) {
-        box.innerHTML = "";
-        return;
-    }
-
-    let bg = "#f7f7f7";
-    let border = "#dddddd";
-
-    if (type === "success") {
-        bg = "#edf8f0";
-        border = "#b8dfc3";
-    }
-
-    if (type === "warning") {
-        bg = "#fff8d9";
-        border = "#ead992";
-    }
-
-    if (type === "error") {
-        bg = "#fdecec";
-        border = "#edbaba";
-    }
-
-    box.innerHTML =
-        '<div style="' +
-            'padding:14px 16px;' +
-            'border-radius:9px;' +
-            'background:' + bg + ';' +
-            'border:1px solid ' + border + ';' +
-            'font-size:13px;' +
-            'line-height:1.45;' +
-        '">' +
-            text +
-        '</div>';
-}
-
-
-// =========================================================
-// CREAR TRABAJO
-// =========================================================
-
-const createWorkButton =
-    document.getElementById("createWork");
-
-
-if (createWorkButton) {
-
-    createWorkButton.onclick = async () => {
-
-        const name =
-            document
-                .getElementById("newWorkName")
-                .value
-                .trim();
-
-        const responsible =
-            document
-                .getElementById("newWorkResponsible")
-                .value
-                .trim();
-
-
-        if (!name) {
-
-            alert(
-                "Ingrese un nombre para el trabajo."
-            );
-
-            return;
-        }
-
-
-        if (!responsible) {
-
-            alert(
-                "Ingrese el responsable del trabajo."
-            );
-
-            return;
-        }
-
-
-        createWorkButton.disabled = true;
-        createWorkButton.textContent = "Creando...";
-
-
-        try {
-
-            const r =
-                await fetch(
-                    "/api/work/create",
-                    {
-                        method: "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body:
-                            JSON.stringify({
-                                name,
-                                responsible
-                            })
-                    }
-                );
-
-
-            const j =
-                await r.json();
-
-
-            if (!r.ok || j.error) {
-
-                alert(
-                    j.error ||
-                    "No se pudo crear el trabajo."
-                );
-
-                return;
-            }
-
-
-            renderWorkState(
-                j.state
-            );
-
-
-            const code =
-                j.work_code;
-
-            const key =
-                j.access_key;
-
-
-            const createdCode =
-                document.getElementById(
-                    "createdWorkCode"
-                );
-
-            const createdKey =
-                document.getElementById(
-                    "createdWorkKey"
-                );
-
-
-            if (createdCode) {
-                createdCode.textContent = code;
-            }
-
-            if (createdKey) {
-                createdKey.textContent = key;
-            }
-
-
-            showWorkMessage(
-
-                '<strong>Trabajo creado correctamente.</strong><br><br>' +
-
-                'Código de trabajo: ' +
-
-                '<strong>' +
-                escapeHtml(code) +
-                '</strong><br>' +
-
-                'Clave de acceso: ' +
-
-                '<strong>' +
-                escapeHtml(key) +
-                '</strong><br><br>' +
-
-                '<strong>Guardá ambos datos.</strong> ' +
-
-                'Los vas a necesitar para abrir este trabajo ' +
-                'desde otra computadora o compartirlo con otra persona del equipo.',
-
-                "warning"
-            );
-
-
-            alert(
-                "Trabajo creado.\n\n" +
-                "Código: " +
-                code +
-                "\n" +
-                "Clave: " +
-                key +
-                "\n\n" +
-                "Guardá ambos datos."
-            );
-
-
-        } catch (err) {
-
-            alert(
-                "Error al crear el trabajo: " +
-                err.message
-            );
-
-        } finally {
-
-            createWorkButton.disabled = false;
-
-            createWorkButton.textContent =
-                "Crear y guardar trabajo";
-        }
-    };
-}
-
-
-// =========================================================
-// ABRIR TRABAJO EXISTENTE
-// =========================================================
-
-const openWorkButton =
-    document.getElementById("openWork");
-
-
-if (openWorkButton) {
-
-    openWorkButton.onclick = async () => {
-
-        const workCode =
-            document
-                .getElementById("openWorkCode")
-                .value
-                .trim();
-
-        const accessKey =
-            document
-                .getElementById("openWorkKey")
-                .value
-                .trim();
-
-
-        if (!workCode || !accessKey) {
-
-            alert(
-                "Ingrese el Código de trabajo y la Clave de acceso."
-            );
-
-            return;
-        }
-
-
-        openWorkButton.disabled = true;
-        openWorkButton.textContent = "Abriendo...";
-
-
-        try {
-
-            const r =
-                await fetch(
-                    "/api/work/open",
-                    {
-                        method: "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body:
-                            JSON.stringify({
-                                work_code:
-                                    workCode,
-
-                                access_key:
-                                    accessKey
-                            })
-                    }
-                );
-
-
-            const j =
-                await r.json();
-
-
-            if (!r.ok || j.error) {
-
-                alert(
-                    j.error ||
-                    "No se pudo abrir el trabajo."
-                );
-
-                return;
-            }
-
-
-            await restoreProjectState(
-                j.state
-            );
-
-
-            renderWorkState(
-                j.state
-            );
-
-
-            showWorkMessage(
-
-                "Trabajo " +
-                escapeHtml(
-                    j.state.work.work_code
-                ) +
-                " recuperado correctamente.",
-
-                "success"
-            );
-
-
-            document
-                .getElementById("openWorkKey")
-                .value = "";
-
-
-        } catch (err) {
-
-            alert(
-                "Error al abrir el trabajo: " +
-                err.message
-            );
-
-        } finally {
-
-            openWorkButton.disabled = false;
-
-            openWorkButton.textContent =
-                "Abrir trabajo";
-        }
-    };
-}
-
-
-// =========================================================
-// GUARDAR TRABAJO
-// =========================================================
-
-const saveWorkButton =
-    document.getElementById("saveWork");
-
-
-if (saveWorkButton) {
-
-    saveWorkButton.onclick = async () => {
-
-        saveWorkButton.disabled = true;
-        saveWorkButton.textContent = "Guardando...";
-
-        try {
-
-            const r =
-                await fetch(
-                    "/api/work/save",
-                    {
-                        method: "POST"
-                    }
-                );
-
-            const j =
-                await r.json();
-
-
-            if (!r.ok || j.error) {
-
-                if (j.conflict) {
-
-                    alert(
-                        j.error +
-                        "\n\nVolvé a abrir el trabajo antes de continuar."
-                    );
-
-                } else {
-
-                    alert(
-                        j.error ||
-                        "No se pudo guardar el trabajo."
-                    );
-                }
-
-                return;
-            }
-
-
-            showWorkMessage(
-
-                "Trabajo " +
-                escapeHtml(
-                    j.work_code
-                ) +
-                " guardado correctamente.",
-
-                "success"
-            );
-
-
-        } catch (err) {
-
-            alert(
-                "Error al guardar: " +
-                err.message
-            );
-
-        } finally {
-
-            saveWorkButton.disabled = false;
-            saveWorkButton.textContent = "Guardar trabajo";
-        }
-    };
-}
-
-
-// =========================================================
-// CERRAR TRABAJO
-// =========================================================
-
-const closeWorkButton =
-    document.getElementById("closeWork");
-
-
-if (closeWorkButton) {
-
-    closeWorkButton.onclick = async () => {
-
-        const ok =
-            confirm(
-                "¿Querés cerrar el trabajo actual?\n\n" +
-                "El trabajo quedará guardado en la base " +
-                "y podrás volver a abrirlo con su Código y Clave."
-            );
-
-
-        if (!ok) return;
-
-
-        try {
-
-            const r =
-                await fetch(
-                    "/api/work/close",
-                    {
-                        method: "POST"
-                    }
-                );
-
-
-            const j =
-                await r.json();
-
-
-            if (!r.ok || j.error) {
-
-                alert(
-                    j.error ||
-                    "No se pudo cerrar el trabajo."
-                );
-
-                return;
-            }
-
-
-            resetAuditUI();
-
-
-            renderWorkState(
-                j.state
-            );
-
-
-            showWorkMessage(
-
-                "Trabajo cerrado. Podés crear uno nuevo o abrir un trabajo existente.",
-
-                "success"
-            );
-
-
-        } catch (err) {
-
-            alert(
-                "Error al cerrar el trabajo: " +
-                err.message
-            );
-        }
-    };
-}
-
-
-// =========================================================
-// RESTAURAR TRABAJO DESDE POSTGRESQL
-// =========================================================
-
-async function restoreProjectState(state) {
-
-    resetAuditUI(false);
-
-
-    if (!state) {
-        return;
-    }
-
-
-    // -----------------------------------------------------
-    // MAPPING
-    // -----------------------------------------------------
-
-    mapping = {};
-
-
-    const storedMapping =
-        state.mapping || {};
-
-
-    Object.entries(
-        storedMapping
-    ).forEach(
-        ([key, value]) => {
-
-            if (!value) return;
-
-            if (
-                key.endsWith("_col")
-            ) {
-
-                const role =
-                    key.substring(
-                        0,
-                        key.length - 4
-                    );
-
-                mapping[role] =
-                    value;
-
-            } else {
-
-                mapping[key] =
-                    value;
-            }
-        }
-    );
-
-
-    // -----------------------------------------------------
-    // POBLACIÓN
-    // -----------------------------------------------------
-
-    if (state.population) {
-
-        population =
-            state.population;
-
-
-        const columns =
-            state.population.columns ||
-            [];
-
-
-        renderMappingControls(
-            columns,
-            mapping
-        );
-
-
-        mappingCard.style.display =
-            "block";
-
-
-        renderPreviewTable(
-
-            columns,
-
-            state.population.preview ||
-            []
-        );
-
-
-        document
-            .getElementById(
-                "N"
+            analysis is None
+            and amount_col in df.columns
+        ):
+            analysis = population_analysis(
+                df,
+                amount_col
             )
-            .value =
-                state.population.rows ||
-                0;
 
+        population_state = {
+            'rows': int(len(df)),
+            'columns': list(df.columns),
+            'preview': (
+                df.head(10)
+                .fillna('')
+                .to_dict(orient='records')
+            ),
+            'analysis': analysis
+        }
 
+    sample_preview = []
+
+    if sample is not None and not sample.empty:
+        sample_preview = (
+            sample
+            .drop(
+                columns=['_amount_numeric'],
+                errors='ignore'
+            )
+            .head(500)
+            .fillna('')
+            .to_dict(orient='records')
+        )
+
+    return {
+        'work': {
+            'work_code': project.get('work_code') or '',
+            'name': project.get('work_name') or '',
+            'responsible': project.get('responsible') or '',
+            'status': project.get('work_status') or '',
+            'created': project.get('created') or '',
+            'source_name': project.get('source_name') or '',
+            'source_hash': project.get('source_hash') or '',
+            'version': project.get('db_version')
+        },
+        'mapping': mapping,
+        'params': params,
+        'population': population_state,
+        'sample': {
+            'rows': int(len(sample)) if sample is not None else 0,
+            'preview': sample_preview
+        },
+        'results': list(
+            (project.get('audit_results') or {}).values()
+        )
+    }
+
+def parse_amount(series):
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors='coerce')
+    cleaned = series.astype(str).str.strip().str.replace('[^0-9,.\\-]', '', regex=True)
+
+    def parse_one(v):
+        if v in ('', '-', '.', ',', 'nan', 'None'):
+            return np.nan
+        try:
+            if ',' in v and '.' in v:
+                if v.rfind(',') > v.rfind('.'):
+                    v = v.replace('.', '').replace(',', '.')
+                else:
+                    v = v.replace(',', '')
+            elif ',' in v:
+                parts = v.split(',')
+                if len(parts[-1]) in (1, 2):
+                    v = v.replace('.', '').replace(',', '.')
+                else:
+                    v = v.replace(',', '')
+            return float(v)
+        except Exception:
+            return np.nan
+    return cleaned.map(parse_one)
+
+def population_analysis(
+    df,
+    amount_col=None,
+    id_col=None,
+    source_rows=None,
+    missing_id_rows=0
+):
+    """
+    Analiza la población ya deduplicada por ID + Importe.
+    """
+    records = int(len(df))
+
+    raw_rows = int(
+        source_rows
+        if source_rows is not None
+        else records
+    )
+
+    missing_id_rows = int(
+        missing_id_rows or 0
+    )
+
+    source_duplicate_rows = max(
+        raw_rows
+        - missing_id_rows
+        - records,
+        0
+    )
+
+    unique_ids = (
+        int(
+            df[id_col]
+            .nunique(dropna=True)
+        )
         if (
-            state.population.analysis
-        ) {
+            id_col
+            and id_col in df.columns
+        )
+        else records
+    )
 
-            renderPopulationAnalysis(
-                state.population.analysis
-            );
-        }
+    ids_multiple_amounts = 0
 
+    if (
+        id_col
+        and id_col in df.columns
+        and amount_col
+        and amount_col in df.columns
+    ):
+        per_id = (
+            df
+            .groupby(
+                id_col,
+                dropna=True
+            )[amount_col]
+            .nunique(dropna=False)
+        )
 
-        const sourceName =
-            state.work &&
-            state.work.source_name
+        ids_multiple_amounts = int(
+            (per_id > 1).sum()
+        )
 
-                ? state.work.source_name
+    result = {
+        "records": records,
+        "unique_ids": unique_ids,
+        "source_rows_raw": raw_rows,
+        "source_duplicate_rows": int(
+            source_duplicate_rows
+        ),
+        "missing_id_rows": missing_id_rows,
+        "ids_multiple_amounts": ids_multiple_amounts,
 
-                : "Población recuperada";
+        # El universo utilizado por la muestra ya no contiene
+        # combinaciones ID + Importe duplicadas.
+        "duplicate_rows": 0,
 
-
-        document
-            .getElementById(
-                "fileStatus"
+        "columns": list(df.columns),
+        "nulls": {
+            str(key): int(value)
+            for key, value in (
+                df.isna()
+                .sum()
+                .to_dict()
+                .items()
             )
-            .textContent =
-
-                sourceName +
-
-                " (" +
-
-                (
-                    state.population.rows ||
-                    0
-                ) +
-
-                " filas)";
-    }
-
-
-    // -----------------------------------------------------
-    // PARÁMETROS
-    // -----------------------------------------------------
-
-    restoreDesignParameters(
-        state.params || {}
-    );
-
-
-    // -----------------------------------------------------
-    // MUESTRA
-    // -----------------------------------------------------
-
-    sample =
-
-        state.sample &&
-        Array.isArray(
-            state.sample.preview
-        )
-
-            ? state.sample.preview
-
-            : [];
-
-
-    lastSelectionCode =
-
-        state.params &&
-        state.params.seed
-
-            ? state.params.seed
-
-            : null;
-
-
-    if (
-        state.sample &&
-        state.sample.rows
-    ) {
-
-        renderRestoredSampleSummary(
-            state
-        );
-
-
-        const repeatArea =
-            document.getElementById(
-                "repeatArea"
-            );
-
-
-        if (repeatArea) {
-
-            repeatArea.style.display =
-                "flex";
-        }
-
-
-        renderSampleTable();
-    }
-
-
-    // -----------------------------------------------------
-    // RESULTADOS
-    // -----------------------------------------------------
-
-    results = {};
-
-
-    if (
-        Array.isArray(
-            state.results
-        )
-    ) {
-
-        state.results.forEach(
-            item => {
-
-                if (
-                    item._original_index === undefined ||
-                    item._original_index === null
-                ) {
-                    return;
-                }
-
-
-                results[
-                    String(
-                        item._original_index
-                    )
-                ] = {
-
-                    status:
-                        item.status || "",
-
-                    registered:
-                        item.registered !== undefined
-                            ? item.registered
-                            : "",
-
-                    validated:
-                        item.validated !== undefined
-                            ? item.validated
-                            : "",
-
-                    difference:
-                        item.difference !== undefined
-                            ? item.difference
-                            : "",
-
-                    exception_type:
-                        item.exception_type || "",
-
-                    comment:
-                        item.comment || "",
-
-                    evidence:
-                        item.evidence || ""
-                };
-            }
-        );
-    }
-
-
-    renderResultsTable();
-
-
-    if (sample.length) {
-
-        try {
-            await updateExtrapolation();
-        } catch (_) {
-            // No interrumpe la restauración.
-        }
-    }
-}
-
-
-function restoreDesignParameters(params) {
-
-    if (!params) return;
-
-
-    if (
-        params.confidence !== undefined
-    ) {
-
-        document
-            .getElementById(
-                "confidence"
-            )
-            .value =
-                String(
-                    params.confidence
-                );
-    }
-
-
-    if (
-        params.error !== undefined
-    ) {
-
-        document
-            .getElementById(
-                "error"
-            )
-            .value =
-                params.error;
-    }
-
-
-    if (
-        params.p !== undefined
-    ) {
-
-        document
-            .getElementById(
-                "p"
-            )
-            .value =
-                params.p;
-
-
-        document
-            .getElementById(
-                "q"
-            )
-            .value =
-                (
-                    1 -
-                    Number(
-                        params.p
-                    )
-                ).toFixed(2);
-    }
-
-
-    document
-        .getElementById(
-            "materiality"
-        )
-        .value =
-
-            params.materiality !== undefined
-
-                ? params.materiality
-
-                : "";
-
-
-    document
-        .getElementById(
-            "tolerable"
-        )
-        .value =
-
-            params.tolerable_error !== undefined
-
-                ? params.tolerable_error
-
-                : "";
-
-
-    document
-        .getElementById(
-            "threshold"
-        )
-        .value =
-
-            params.significant_threshold !== undefined
-
-                ? params.significant_threshold
-
-                : "";
-
-
-    document
-        .getElementById(
-            "incMat"
-        )
-        .checked =
-
-            Boolean(
-                params.include_materiality
-            );
-
-
-    document
-        .getElementById(
-            "incOut"
-        )
-        .checked =
-
-            Boolean(
-                params.include_outliers
-            );
-
-
-    if (
-        params.method
-    ) {
-
-        const radio =
-            document.querySelector(
-                'input[name="method"][value="' +
-                params.method +
-                '"]'
-            );
-
-
-        if (radio) {
-
-            radio.checked =
-                true;
         }
     }
 
-
-    document
-        .getElementById(
-            "nResult"
+    if amount_col and amount_col in df.columns:
+        x = (
+            parse_amount(
+                df[amount_col]
+            )
+            .dropna()
         )
-        .textContent =
 
-            params.n
-                ? params.n
-                : "-";
-}
+        if len(x):
+            q1 = x.quantile(0.25)
+            q3 = x.quantile(0.75)
+            iqr = q3 - q1
 
+            lower = q1 - 3 * iqr
+            upper = q3 + 3 * iqr
 
-function renderRestoredSampleSummary(state) {
+            abs_x = x.abs()
+            abs_total = float(
+                abs_x.sum()
+            )
 
-    const params =
-        state.params || {};
-
-
-    const populationRows =
-
-        state.population
-            ? state.population.rows || 0
-            : 0;
-
-
-    const sampleRows =
-
-        state.sample
-            ? state.sample.rows || 0
-            : 0;
-
-
-    const coverageCount =
-
-        populationRows
-
-            ? sampleRows /
-              populationRows *
-              100
-
-            : 0;
-
-
-    let coverageAmountText =
-        "-";
-
-
-    const amountCol =
-        mapping.amount;
-
-
-    const analysis =
-
-        state.population
-            ? state.population.analysis
-            : null;
-
-
-    if (
-        amountCol &&
-        analysis &&
-        analysis.amount_abs_total &&
-        sample.length === sampleRows
-    ) {
-
-        const selectedAmount =
-
-            sample.reduce(
-                (total, row) => {
-
-                    const number =
-                        Number(
-                            row[amountCol]
-                        );
-
-                    return total +
-
+            result.update(
+                {
+                    "amount_valid": int(len(x)),
+                    "amount_total": float(x.sum()),
+                    "amount_abs_total": abs_total,
+                    "mean": float(x.mean()),
+                    "median": float(x.median()),
+                    "min": float(x.min()),
+                    "max": float(x.max()),
+                    "std": (
+                        float(x.std(ddof=1))
+                        if len(x) > 1
+                        else 0
+                    ),
+                    "zeros": int((x == 0).sum()),
+                    "negatives": int((x < 0).sum()),
+                    "outliers": int(
                         (
-                            Number.isFinite(
-                                number
+                            (x < lower)
+                            | (x > upper)
+                        ).sum()
+                    ),
+                    "outlier_lower": float(lower),
+                    "outlier_upper": float(upper),
+                    "top10_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(10, len(abs_x))
                             )
-
-                                ? Math.abs(
-                                    number
-                                )
-
-                                : 0
-                        );
-                },
-                0
-            );
-
-
-        coverageAmountText =
-
-            (
-                selectedAmount /
-                analysis.amount_abs_total *
-                100
-            ).toFixed(2) +
-
-            "%";
-    }
-
-
-    const methodLabels = {
-
-        random:
-            "Aleatorio simple",
-
-        systematic:
-            "Sistemático",
-
-        stratified:
-            "Estratificado",
-
-        mus:
-            "MUS / PPS",
-
-        topn:
-            "Top N"
-    };
-
-
-    document
-        .getElementById(
-            "sampleSummary"
-        )
-        .innerHTML =
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Tamaño' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    sampleRows +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Cobertura registros' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    coverageCount.toFixed(2) +
-                    '%' +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Cobertura monetaria' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    coverageAmountText +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item code-pill">' +
-
-                '<span class="summary-label">' +
-                    'Código de selección' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-                    (
-                        params.seed ||
-                        "-"
-                    ) +
-                '</span>' +
-
-            '</div>' +
-
-
-            '<div class="summary-item">' +
-
-                '<span class="summary-label">' +
-                    'Método' +
-                '</span>' +
-
-                '<span class="summary-value">' +
-
-                    (
-                        methodLabels[
-                            params.method
-                        ] ||
-
-                        params.method ||
-
-                        "-"
-                    ) +
-
-                '</span>' +
-
-            '</div>';
-}
-
-
-// =========================================================
-// RESETEAR INTERFAZ
-// =========================================================
-
-function resetAuditUI(clearWorkMessage = true) {
-
-    population = null;
-    mapping = {};
-    sample = [];
-    results = {};
-    lastSelectionCode = null;
-
-
-    mappingDiv.innerHTML =
-        "";
-
-
-    mappingCard.style.display =
-        "none";
-
-
-    document
-        .getElementById(
-            "populationResults"
-        )
-        .style.display =
-            "none";
-
-
-    preview.innerHTML =
-        "";
-
-
-    popKpis.innerHTML =
-        "";
-
-
-    quality.innerHTML =
-        "";
-
-
-    document
-        .getElementById(
-            "N"
-        )
-        .value =
-            "";
-
-
-    document
-        .getElementById(
-            "nResult"
-        )
-        .textContent =
-            "-";
-
-
-    document
-        .getElementById(
-            "sampleSummary"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "sampleTable"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "resultsTable"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "resultsDash"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "observed"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "projected"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "extraWarning"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "summary"
-        )
-        .innerHTML =
-            "";
-
-
-    document
-        .getElementById(
-            "conclusion"
-        )
-        .textContent =
-            "Genere y evalúe la muestra para obtener el resumen.";
-
-
-    document
-        .getElementById(
-            "fileStatus"
-        )
-        .textContent =
-            "Sin población cargada";
-
-
-    const repeatArea =
-        document.getElementById(
-            "repeatArea"
-        );
-
-
-    if (repeatArea) {
-
-        repeatArea.style.display =
-            "none";
-    }
-
-
-    if (clearWorkMessage) {
-
-        showWorkMessage("");
-    }
-}
-
-
-// =========================================================
-// CARGA DE ARCHIVO
-// =========================================================
-
-drop.onclick =
-    () => file.click();
-
-
-file.onchange =
-    upload;
-
-
-drop.ondragover = e => {
-
-    e.preventDefault();
-
-    drop.style.borderColor =
-        "var(--primary)";
-};
-
-
-drop.ondragleave =
-    () => {
-
-        drop.style.borderColor =
-            "";
-    };
-
-
-drop.ondrop = e => {
-
-    e.preventDefault();
-
-    drop.style.borderColor =
-        "";
-
-
-    if (
-        e.dataTransfer.files.length
-    ) {
-
-        upload({
-            target: {
-                files:
-                    e.dataTransfer.files
-            }
-        });
-    }
-};
-
-
-async function upload(e) {
-
-    const f =
-        e.target.files[0];
-
-
-    if (!f) return;
-
-
-    const fd =
-        new FormData();
-
-
-    fd.append(
-        "file",
-        f
-    );
-
-
-    msg.innerHTML =
-        "Cargando...";
-
-
-    try {
-
-        const r =
-            await fetch(
-                "/api/upload",
-                {
-                    method:
-                        "POST",
-
-                    body:
-                        fd
-                }
-            );
-
-
-        const j =
-    await readJsonResponse(r);
-
-
-        if (
-            !r.ok ||
-            j.error
-        ) {
-
-            alert(
-                j.error ||
-                "No se pudo cargar la población."
-            );
-
-            msg.innerHTML =
-                j.error || "";
-
-            return;
-        }
-
-
-        mapping = {};
-        sample = [];
-        results = {};
-        lastSelectionCode = null;
-
-
-        msg.innerHTML =
-
-            "Archivo: " +
-
-            f.name +
-
-            " (" +
-
-            j.rows +
-
-            " filas)";
-
-
-        document
-            .getElementById(
-                "fileStatus"
-            )
-            .textContent =
-
-                f.name +
-
-                " (" +
-
-                j.rows +
-
-                " filas)";
-
-
-        renderMappingControls(
-            j.columns,
-            {}
-        );
-
-
-        mappingCard.style.display =
-            "block";
-
-
-        population =
-            j;
-
-
-        renderPreviewTable(
-            j.columns,
-            j.preview
-        );
-
-
-        document
-            .getElementById(
-                "populationResults"
-            )
-            .style.display =
-                "none";
-
-
-        document
-            .getElementById(
-                "sampleSummary"
-            )
-            .innerHTML =
-                "";
-
-
-        document
-            .getElementById(
-                "sampleTable"
-            )
-            .innerHTML =
-                "";
-
-
-        document
-            .getElementById(
-                "resultsTable"
-            )
-            .innerHTML =
-                "";
-
-
-        document
-            .getElementById(
-                "resultsDash"
-            )
-            .innerHTML =
-                "";
-
-
-    } catch (err) {
-
-        msg.innerHTML =
-            "Error: " +
-            err.message;
-    }
-}
-
-
-// =========================================================
-// MAPEO
-// =========================================================
-
-function renderMappingControls(
-    columns,
-    restoredMapping = {}
-) {
-
-    mappingDiv.innerHTML =
-        "";
-
-
-    const roleByColumn =
-        {};
-
-
-    Object.entries(
-        restoredMapping
-    ).forEach(
-        ([role, column]) => {
-
-            if (column) {
-                roleByColumn[column] =
-                    role;
-            }
-        }
-    );
-
-
-    columns.forEach(
-        column => {
-
-            const selectedRole =
-                roleByColumn[column] ||
-                "";
-
-
-            mappingDiv.innerHTML +=
-
-                '<div class="form-group">' +
-
-                    '<label>' +
-                        escapeHtml(column) +
-                    '</label>' +
-
-                    '<select ' +
-                        'class="col-map" ' +
-                        'data-col="' +
-                        escapeAttribute(column) +
-                    '">' +
-
-                        mappingOption(
-                            "",
-                            "Ignorar",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "id",
-                            "ID",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "amount",
-                            "Importe",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "date",
-                            "Fecha",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "vendor",
-                            "Proveedor",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "company",
-                            "Sociedad",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "center",
-                            "Centro",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "user",
-                            "Usuario",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "doctype",
-                            "Tipo Doc",
-                            selectedRole
-                        ) +
-
-                        mappingOption(
-                            "account",
-                            "Cuenta",
-                            selectedRole
-                        ) +
-
-                    '</select>' +
-
-                '</div>';
-        }
-    );
-}
-
-
-function mappingOption(
-    value,
-    label,
-    selected
-) {
-
-    return (
-
-        '<option value="' +
-        value +
-        '"' +
-
-        (
-            value === selected
-                ? " selected"
-                : ""
-        ) +
-
-        '>' +
-
-        label +
-
-        '</option>'
-    );
-}
-
-
-// =========================================================
-// PREVIEW
-// =========================================================
-
-function renderPreviewTable(
-    columns,
-    rows
-) {
-
-    preview.innerHTML =
-
-        "<thead><tr>" +
-
-        columns
-            .map(
-                column =>
-                    "<th>" +
-                    escapeHtml(column) +
-                    "</th>"
-            )
-            .join("") +
-
-        "</tr></thead>" +
-
-
-        "<tbody>" +
-
-        rows
-            .map(
-                row =>
-
-                    "<tr>" +
-
-                    columns
-                        .map(
-                            column =>
-
-                                "<td>" +
-
-                                escapeHtml(
-                                    displayValue(
-                                        row[column]
-                                    )
-                                ) +
-
-                                "</td>"
+                            .sum()
+                            / abs_total
+                            * 100
                         )
-                        .join("") +
-
-                    "</tr>"
-            )
-            .join("") +
-
-        "</tbody>";
-}
-
-
-// =========================================================
-// ANÁLISIS DE POBLACIÓN
-// =========================================================
-
-analyze.onclick =
-    async () => {
-
-        mapping =
-            {};
-
-
-        document
-            .querySelectorAll(
-                ".col-map"
-            )
-            .forEach(
-                select => {
-
-                    if (
-                        select.value
-                    ) {
-
-                        mapping[
-                            select.value
-                        ] =
-                            select.dataset.col;
-                    }
-                }
-            );
-
-
-        if (
-            !mapping.id ||
-            !mapping.amount
-        ) {
-
-            alert(
-                "Seleccione ID e Importe."
-            );
-
-            return;
-        }
-
-
-        const r =
-            await fetch(
-                "/api/analyze",
-                {
-                    method:
-                        "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(
-                            mapping
-                        )
-                }
-            );
-
-
-        const j =
-            await r.json();
-
-
-        if (
-            !r.ok ||
-            j.error
-        ) {
-
-            alert(
-                j.error ||
-                "No se pudo analizar la población."
-            );
-
-            return;
-        }
-
-
-        renderPopulationAnalysis(
-            j
-        );
-
-
-        document
-            .getElementById(
-                "N"
-            )
-            .value =
-                j.records;
-    };
-
-
-function renderPopulationAnalysis(j) {
-
-    document
-        .getElementById(
-            "populationResults"
-        )
-        .style.display =
-            "block";
-
-
-    popKpis.innerHTML =
-
-        kpiCard(
-            "Registros",
-            (
-                j.records ||
-                0
-            ).toLocaleString()
-        ) +
-
-        kpiCard(
-            "Importe Total",
-            formatMoney(
-                j.amount_total || 0
-            )
-        ) +
-
-        kpiCard(
-            "Promedio",
-            formatMoney(
-                j.mean || 0
-            )
-        ) +
-
-        kpiCard(
-            "Mediana",
-            formatMoney(
-                j.median || 0
-            )
-        ) +
-
-        kpiCard(
-            "Máximo",
-            formatMoney(
-                j.max || 0
-            )
-        ) +
-
-        kpiCard(
-            "Mínimo",
-            formatMoney(
-                j.min || 0
-            )
-        ) +
-
-        kpiCard(
-            "Desv. Estándar",
-            formatMoney(
-                j.std || 0
-            )
-        ) +
-
-        kpiCard(
-            "Duplicados",
-            j.duplicate_rows || 0
-        );
-
-
-    quality.innerHTML =
-
-        qualityItem(
-            "Ceros",
-            j.zeros || 0
-        ) +
-
-        qualityItem(
-            "Negativos",
-            j.negatives || 0
-        ) +
-
-        qualityItem(
-            "Outliers",
-            j.outliers || 0
-        ) +
-
-        qualityItem(
-            "Top 10",
-            (
-                j.top10_pct || 0
-            ).toFixed(1) +
-            "%"
-        ) +
-
-        qualityItem(
-            "Top 20",
-            (
-                j.top20_pct || 0
-            ).toFixed(1) +
-            "%"
-        ) +
-
-        qualityItem(
-            "Top 50",
-            (
-                j.top50_pct || 0
-            ).toFixed(1) +
-            "%"
-        );
-}
-
-
-function kpiCard(
-    label,
-    value
-) {
-
-    return (
-
-        '<div class="kpi-card">' +
-
-            '<div class="kpi-label">' +
-                label +
-            '</div>' +
-
-            '<div class="kpi-value">' +
-                value +
-            '</div>' +
-
-        '</div>'
-    );
-}
-
-
-function qualityItem(
-    label,
-    value
-) {
-
-    return (
-
-        '<div class="quality-item">' +
-
-            '<span class="quality-label">' +
-                label +
-            '</span>' +
-
-            '<span class="quality-value">' +
-                value +
-            '</span>' +
-
-        '</div>'
-    );
-}
-
-
-// =========================================================
-// P Y Q
-// =========================================================
-
-document
-    .getElementById("p")
-    .oninput =
-        () => {
-
-            const p =
-                parseFloat(
-                    document
-                        .getElementById(
-                            "p"
-                        )
-                        .value
-                ) || 0.5;
-
-
-            document
-                .getElementById(
-                    "q"
-                )
-                .value =
-                    (
-                        1 - p
-                    ).toFixed(2);
-        };
-
-
-document
-    .getElementById("q")
-    .value =
-        "0.5";
-
-
-// =========================================================
-// EXPLICACIÓN DEL TAMAÑO DE MUESTRA
-// =========================================================
-
-document
-    .getElementById(
-        "howSample"
-    )
-    .onclick =
-        () => {
-
-            const N =
-                parseInt(
-                    document
-                        .getElementById(
-                            "N"
-                        )
-                        .value
-                ) || 0;
-
-
-            const conf =
-                document
-                    .getElementById(
-                        "confidence"
-                    )
-                    .value;
-
-
-            const e =
-                parseFloat(
-                    document
-                        .getElementById(
-                            "error"
-                        )
-                        .value
-                ) || 0.05;
-
-
-            const p =
-                parseFloat(
-                    document
-                        .getElementById(
-                            "p"
-                        )
-                        .value
-                ) || 0.5;
-
-
-            const q =
-                1 - p;
-
-
-            const zmap = {
-                "90": 1.645,
-                "95": 1.96,
-                "97": 2.17,
-                "99": 2.576
-            };
-
-
-            const z =
-                zmap[conf];
-
-
-            const n =
-
-                (
-                    z *
-                    z *
-                    p *
-                    q *
-                    N
-                )
-
-                /
-
-                (
-                    e *
-                    e *
-                    (
-                        N - 1
-                    )
-
-                    +
-
-                    z *
-                    z *
-                    p *
-                    q
-                );
-
-
-            document
-                .getElementById(
-                    "modalText"
-                )
-                .innerHTML =
-
-                    '<p><strong>Fórmula</strong>: ' +
-
-                    'n = (Z² × p × q × N) / ' +
-
-                    '[e² × (N-1) + Z² × p × q]</p>' +
-
-                    '<p><strong>Variables</strong>:<br>' +
-
-                    'Z = ' +
-                    z +
-                    ' (confianza ' +
-                    conf +
-                    '%)<br>' +
-
-                    'p = ' +
-                    p +
-                    '<br>' +
-
-                    'q = ' +
-                    q.toFixed(2) +
-                    '<br>' +
-
-                    'N = ' +
-                    N +
-                    '<br>' +
-
-                    'e = ' +
-                    e +
-
-                    '</p>' +
-
-                    '<p><strong>Resultado</strong>: n = ' +
-
-                    Math.ceil(n) +
-
-                    ' registros</p>';
-
-
-            document
-                .getElementById(
-                    "modal"
-                )
-                .classList
-                .add(
-                    "active"
-                );
-        };
-
-
-// =========================================================
-// CERRAR MODAL
-// =========================================================
-
-const modalClose =
-    document.querySelector(
-        ".modal-close"
-    );
-
-
-if (modalClose) {
-
-    modalClose.onclick =
-        () => {
-
-            document
-                .getElementById(
-                    "modal"
-                )
-                .classList
-                .remove(
-                    "active"
-                );
-        };
-}
-
-
-// =========================================================
-// RECOMENDACIÓN
-// =========================================================
-
-document
-    .getElementById(
-        "recommend"
-    )
-    .onclick =
-        async () => {
-
-            if (
-                !mapping.amount
-            ) {
-
-                alert(
-                    "Analice la población primero."
-                );
-
-                return;
-            }
-
-
-            const r =
-                await fetch(
-                    "/api/recommend",
-                    {
-                        method:
-                            "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body:
-                            JSON.stringify({
-                                amount_col:
-                                    mapping.amount,
-
-                                significant_threshold:
-                                    parseFloat(
-                                        document
-                                            .getElementById(
-                                                "threshold"
-                                            )
-                                            .value
-                                    ) || 0
-                            })
-                    }
-                );
-
-
-            const j =
-                await r.json();
-
-
-            if (
-                !r.ok ||
-                j.error
-            ) {
-
-                alert(
-                    j.error ||
-                    "No se pudo generar la recomendación."
-                );
-
-                return;
-            }
-
-
-            const box =
-                document.getElementById(
-                    "recommendationBox"
-                );
-
-
-            box.style.display =
-                "block";
-
-
-            box.innerHTML =
-
-                '<p><strong>Recomendación</strong>: ' +
-
-                j.recommendation +
-
-                '</p>' +
-
-                '<p><strong>Razones</strong>:</p>' +
-
-                '<ul>' +
-
-                j.reasons
-                    .map(
-                        reason =>
-                            "<li>" +
-                            escapeHtml(reason) +
-                            "</li>"
-                    )
-                    .join("") +
-
-                '</ul>';
-        };
-
-
-// =========================================================
-// GENERAR / REPETIR MUESTRA
-// =========================================================
-
-async function generateSample(
-    selectionCode = null,
-    isRepeat = false
-) {
-
-    if (
-        !mapping.id ||
-        !mapping.amount
-    ) {
-
-        alert(
-            "Analice la población primero."
-        );
-
-        return;
-    }
-
-
-    const N =
-        parseInt(
-            document
-                .getElementById(
-                    "N"
-                )
-                .value
-        ) || 0;
-
-
-    const conf =
-        document
-            .getElementById(
-                "confidence"
-            )
-            .value;
-
-
-    const e =
-        parseFloat(
-            document
-                .getElementById(
-                    "error"
-                )
-                .value
-        ) || 0.05;
-
-
-    const p =
-        parseFloat(
-            document
-                .getElementById(
-                    "p"
-                )
-                .value
-        ) || 0.5;
-
-
-    const calcResponse =
-        await fetch(
-            "/api/calculate-sample",
-            {
-                method:
-                    "POST",
-
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify({
-                        N,
-                        confidence:
-                            conf,
-                        error:
-                            e,
-                        p
-                    })
-            }
-        );
-
-
-    const calc =
-        await calcResponse.json();
-
-
-    if (
-        !calcResponse.ok ||
-        calc.error
-    ) {
-
-        alert(
-            calc.error ||
-            "No se pudo calcular el tamaño de muestra."
-        );
-
-        return;
-    }
-
-
-    document
-        .getElementById(
-            "nResult"
-        )
-        .textContent =
-            calc.n;
-
-
-    const method =
-        document
-            .querySelector(
-                'input[name="method"]:checked'
-            )
-            .value;
-
-
-    const payload = {
-
-        id_col:
-            mapping.id,
-
-        amount_col:
-            mapping.amount,
-
-        method,
-
-        n:
-            calc.n,
-
-        confidence:
-            conf,
-
-        error:
-            e,
-
-        p,
-
-        seed:
-
-            selectionCode !== null
-
-                ? selectionCode
-
-                : Date.now(),
-
-        include_materiality:
-
-            document
-                .getElementById(
-                    "incMat"
-                )
-                .checked,
-
-        include_outliers:
-
-            document
-                .getElementById(
-                    "incOut"
-                )
-                .checked,
-
-        significant_threshold:
-
-            parseFloat(
-                document
-                    .getElementById(
-                        "threshold"
-                    )
-                    .value
-            ) || 0,
-
-        materiality:
-
-            parseFloat(
-                document
-                    .getElementById(
-                        "materiality"
-                    )
-                    .value
-            ) || 0,
-
-        tolerable_error:
-
-            parseFloat(
-                document
-                    .getElementById(
-                        "tolerable"
-                    )
-                    .value
-            ) || 0
-    };
-
-
-    const r =
-        await fetch(
-            "/api/generate-sample",
-            {
-                method:
-                    "POST",
-
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify(
-                        payload
-                    )
-            }
-        );
-
-
-    const j =
-        await r.json();
-
-
-    if (
-        !r.ok ||
-        j.error
-    ) {
-
-        if (
-            j.conflict
-        ) {
-
-            alert(
-                j.error +
-                "\n\nVolvé a abrir el trabajo antes de continuar."
-            );
-
-        } else {
-
-            alert(
-                j.error ||
-                "No se pudo generar la muestra."
-            );
-        }
-
-        return;
-    }
-
-
-    sample =
-        j.preview || [];
-
-
-    lastSelectionCode =
-        j.seed;
-
-
-    if (
-        !isRepeat
-    ) {
-
-        results =
-            {};
-    }
-
-
-    renderGeneratedSampleSummary(
-        j,
-        method
-    );
-
-
-    const repeatArea =
-        document.getElementById(
-            "repeatArea"
-        );
-
-
-    if (
-        repeatArea
-    ) {
-
-        repeatArea.style.display =
-            "flex";
-    }
-
-
-    renderSampleTable();
-
-    renderResultsTable();
-
-
-    if (
-        isRepeat
-    ) {
-
-        alert(
-            "Selección reproducida correctamente.\n" +
-
-            "Código de selección: " +
-
-            lastSelectionCode
-        );
-
-    } else {
-
-        alert(
-            "Muestra: " +
-            j.rows +
-            " registros"
-        );
-    }
-}
-
-
-function renderGeneratedSampleSummary(
-    j,
-    method
-) {
-
-    const methodLabels = {
-        random:
-            "Aleatorio simple",
-        systematic:
-            "Sistemático",
-        stratified:
-            "Estratificado",
-        mus:
-            "MUS / PPS",
-        topn:
-            "Top N"
-    };
-
-
-    document
-        .getElementById(
-            "sampleSummary"
-        )
-        .innerHTML =
-
-            summaryItem(
-                "Tamaño",
-                j.rows || 0
-            ) +
-
-            summaryItem(
-                "Cobertura registros",
-                (
-                    j.coverage_count ||
-                    0
-                ).toFixed(2) +
-                "%"
-            ) +
-
-            summaryItem(
-                "Cobertura monetaria",
-                (
-                    j.coverage_amount ||
-                    0
-                ).toFixed(2) +
-                "%"
-            ) +
-
-            summaryItem(
-                "Código de selección",
-                j.seed,
-                "code-pill"
-            ) +
-
-            summaryItem(
-                "Método",
-                methodLabels[method] ||
-                method
-            );
-}
-
-
-function summaryItem(
-    label,
-    value,
-    extraClass = ""
-) {
-
-    return (
-
-        '<div class="summary-item ' +
-        extraClass +
-        '">' +
-
-            '<span class="summary-label">' +
-                label +
-            '</span>' +
-
-            '<span class="summary-value">' +
-                value +
-            '</span>' +
-
-        '</div>'
-    );
-}
-
-
-document
-    .getElementById(
-        "generate"
-    )
-    .onclick =
-        async () => {
-
-            await generateSample(
-                null,
-                false
-            );
-        };
-
-
-const repeatSelectionButton =
-    document.getElementById(
-        "repeatSelection"
-    );
-
-
-if (
-    repeatSelectionButton
-) {
-
-    repeatSelectionButton.onclick =
-        async () => {
-
-            if (
-                !lastSelectionCode
-            ) {
-
-                alert(
-                    "Primero genere una muestra."
-                );
-
-                return;
-            }
-
-
-            await generateSample(
-                lastSelectionCode,
-                true
-            );
-        };
-}
-
-
-// =========================================================
-// TABLA DE MUESTRA
-// =========================================================
-
-function getVisibleSampleColumns() {
-
-    if (
-        !sample.length
-    ) {
-
-        return [];
-    }
-
-
-    return Object
-        .keys(
-            sample[0]
-        )
-        .filter(
-            column =>
-
-                !column.startsWith(
-                    "_"
-                )
-
-                &&
-
-                column !==
-                    "Tipo_Seleccion"
-        );
-}
-
-
-function renderSampleTable() {
-
-    const table =
-        document.getElementById(
-            "sampleTable"
-        );
-
-
-    if (
-        !sample.length
-    ) {
-
-        table.innerHTML =
-            "";
-
-        return;
-    }
-
-
-    const cols =
-        getVisibleSampleColumns();
-
-
-    table.innerHTML =
-
-        "<thead><tr>" +
-
-        cols
-            .map(
-                column =>
-                    "<th>" +
-                    escapeHtml(column) +
-                    "</th>"
-            )
-            .join("") +
-
-        "</tr></thead>" +
-
-        "<tbody>" +
-
-        sample
-            .map(
-                row =>
-
-                    "<tr>" +
-
-                    cols
-                        .map(
-                            column =>
-
-                                "<td>" +
-
-                                escapeHtml(
-                                    displayValue(
-                                        row[column]
-                                    )
-                                ) +
-
-                                "</td>"
-                        )
-                        .join("") +
-
-                    "</tr>"
-            )
-            .join("") +
-
-        "</tbody>";
-}
-
-
-// =========================================================
-// RESULTADOS
-// =========================================================
-
-function getOriginalIndex(
-    row,
-    fallback
-) {
-
-    if (
-        row._original_index !== undefined &&
-        row._original_index !== null &&
-        row._original_index !== ""
-    ) {
-
-        return row._original_index;
-    }
-
-
-    return fallback;
-}
-
-
-function getRegisteredAmount(
-    row
-) {
-
-    if (
-        mapping.amount &&
-        row[mapping.amount] !== undefined &&
-        row[mapping.amount] !== null &&
-        row[mapping.amount] !== ""
-    ) {
-
-        return row[
-            mapping.amount
-        ];
-    }
-
-
-    return "";
-}
-
-
-function renderResultsTable() {
-
-    const table =
-        document.getElementById(
-            "resultsTable"
-        );
-
-
-    if (
-        !sample.length
-    ) {
-
-        table.innerHTML =
-            "";
-
-        updateResultsDashboard();
-
-        return;
-    }
-
-
-    const cols =
-        getVisibleSampleColumns();
-
-
-    table.innerHTML =
-
-        "<thead><tr>" +
-
-        cols
-            .map(
-                column =>
-                    "<th>" +
-                    escapeHtml(column) +
-                    "</th>"
-            )
-            .join("") +
-
-        '<th class="audit-col">Resultado de revisión</th>' +
-
-        '<th class="audit-col">Importe registrado</th>' +
-
-        '<th class="audit-col">Importe validado</th>' +
-
-        '<th class="audit-col">Diferencia</th>' +
-
-        '<th class="audit-col">Tipo de excepción</th>' +
-
-        '<th class="audit-col">Comentario del auditor</th>' +
-
-        '<th class="audit-col">Referencia de evidencia</th>' +
-
-        "</tr></thead>" +
-
-        "<tbody>" +
-
-        sample
-            .map(
-                (
-                    row,
-                    i
-                ) => {
-
-                    const orig =
-                        getOriginalIndex(
-                            row,
-                            i
-                        );
-
-
-                    const key =
-                        String(orig);
-
-
-                    results[key] =
-                        results[key] ||
-                        {};
-
-
-                    const res =
-                        results[key];
-
-
-                    const defaultRegistered =
-                        getRegisteredAmount(
-                            row
-                        );
-
-
-                    const registeredValue =
-
-                        res.registered !== undefined &&
-                        res.registered !== ""
-
-                            ? res.registered
-
-                            : defaultRegistered;
-
-
-                    if (
-                        res.registered === undefined ||
-                        res.registered === ""
-                    ) {
-
-                        res.registered =
-                            registeredValue;
-                    }
-
-
-                    const validatedValue =
-
-                        res.validated !== undefined
-
-                            ? res.validated
-
-                            : "";
-
-
-                    return (
-
-                        "<tr>" +
-
-                        cols
-                            .map(
-                                column =>
-
-                                    "<td>" +
-
-                                    escapeHtml(
-                                        displayValue(
-                                            row[column]
-                                        )
-                                    ) +
-
-                                    "</td>"
+                        if abs_total
+                        else 0
+                    ),
+                    "top20_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(20, len(abs_x))
                             )
-                            .join("") +
-
-
-                        '<td class="audit-col">' +
-
-                            '<select ' +
-                                'class="res-status form-input" ' +
-                                'data-idx="' +
-                                orig +
-                            '">' +
-
-                                optionSelected(
-                                    "",
-                                    "Pendiente",
-                                    res.status
-                                ) +
-
-                                optionSelected(
-                                    "Sin excepción",
-                                    "Sin excepción",
-                                    res.status
-                                ) +
-
-                                optionSelected(
-                                    "Excepción monetaria",
-                                    "Excepción monetaria",
-                                    res.status
-                                ) +
-
-                                optionSelected(
-                                    "Excepción no monetaria",
-                                    "Excepción no monetaria",
-                                    res.status
-                                ) +
-
-                            '</select>' +
-
-                        '</td>' +
-
-
-                        '<td class="audit-col">' +
-
-                            '<input ' +
-                                'class="res-registered form-input" ' +
-                                'type="number" ' +
-                                'step="any" ' +
-                                'data-idx="' +
-                                orig +
-                                '" ' +
-                                'value="' +
-                                safeInputValue(
-                                    registeredValue
-                                ) +
-                            '">' +
-
-                        '</td>' +
-
-
-                        '<td class="audit-col">' +
-
-                            '<input ' +
-                                'class="res-validated form-input" ' +
-                                'type="number" ' +
-                                'step="any" ' +
-                                'data-idx="' +
-                                orig +
-                                '" ' +
-                                'value="' +
-                                safeInputValue(
-                                    validatedValue
-                                ) +
-                            '">' +
-
-                        '</td>' +
-
-
-                        '<td ' +
-                            'class="audit-col res-diff" ' +
-                            'data-idx="' +
-                            orig +
-                        '">' +
-
-                            formatDifference(
-                                res.difference
-                            ) +
-
-                        '</td>' +
-
-
-                        '<td class="audit-col">' +
-
-                            '<select ' +
-                                'class="res-exception-type form-input" ' +
-                                'data-idx="' +
-                                orig +
-                            '">' +
-
-                                optionSelected(
-                                    "",
-                                    "-",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Monetaria",
-                                    "Monetaria",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Documental",
-                                    "Documental",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Cumplimiento",
-                                    "Cumplimiento",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Duplicado",
-                                    "Duplicado",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Imputación / registración",
-                                    "Imputación / registración",
-                                    res.exception_type
-                                ) +
-
-                                optionSelected(
-                                    "Otro",
-                                    "Otro",
-                                    res.exception_type
-                                ) +
-
-                            '</select>' +
-
-                        '</td>' +
-
-
-                        '<td class="audit-col">' +
-
-                            '<input ' +
-                                'class="res-comment form-input" ' +
-                                'type="text" ' +
-                                'data-idx="' +
-                                orig +
-                                '" ' +
-                                'placeholder="Describa brevemente la revisión" ' +
-                                'value="' +
-                                escapeAttribute(
-                                    res.comment ||
-                                    ""
-                                ) +
-                            '">' +
-
-                        '</td>' +
-
-
-                        '<td class="audit-col">' +
-
-                            '<input ' +
-                                'class="res-evidence form-input" ' +
-                                'type="text" ' +
-                                'data-idx="' +
-                                orig +
-                                '" ' +
-                                'placeholder="Factura, OC, SAP, ticket..." ' +
-                                'value="' +
-                                escapeAttribute(
-                                    res.evidence ||
-                                    ""
-                                ) +
-                            '">' +
-
-                        '</td>' +
-
-                        "</tr>"
-                    );
+                            .sum()
+                            / abs_total
+                            * 100
+                        )
+                        if abs_total
+                        else 0
+                    ),
+                    "top50_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(50, len(abs_x))
+                            )
+                            .sum()
+                            / abs_total
+                            * 100
+                        )
+                        if abs_total
+                        else 0
+                    )
                 }
             )
-            .join("") +
 
-        "</tbody>";
-
-
-    bindResultEvents();
-
-    updateResultsDashboard();
-}
-
-
-// =========================================================
-// EVENTOS RESULTADOS
-// =========================================================
-
-function bindResultEvents() {
-
-    document
-        .querySelectorAll(
-            ".res-registered, .res-validated"
-        )
-        .forEach(
-            input => {
-
-                input.oninput =
-                    calcDiff;
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-status"
-        )
-        .forEach(
-            select => {
-
-                select.onchange =
-                    handleStatusChange;
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-exception-type"
-        )
-        .forEach(
-            select => {
-
-                select.onchange =
-                    () => {
-
-                        const idx =
-                            String(
-                                select.dataset.idx
-                            );
-
-
-                        results[idx] =
-                            results[idx] ||
-                            {};
-
-
-                        results[idx].exception_type =
-                            select.value;
-
-
-                        updateResultsDashboard();
-                    };
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-comment"
-        )
-        .forEach(
-            input => {
-
-                input.oninput =
-                    () => {
-
-                        const idx =
-                            String(
-                                input.dataset.idx
-                            );
-
-
-                        results[idx] =
-                            results[idx] ||
-                            {};
-
-
-                        results[idx].comment =
-                            input.value;
-                    };
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-evidence"
-        )
-        .forEach(
-            input => {
-
-                input.oninput =
-                    () => {
-
-                        const idx =
-                            String(
-                                input.dataset.idx
-                            );
-
-
-                        results[idx] =
-                            results[idx] ||
-                            {};
-
-
-                        results[idx].evidence =
-                            input.value;
-                    };
-            }
-        );
-}
-
-
-// =========================================================
-// ESTADO DE REVISIÓN
-// =========================================================
-
-function handleStatusChange(e) {
-
-    const select =
-        e.target;
-
-
-    const idx =
-        String(
-            select.dataset.idx
-        );
-
-
-    results[idx] =
-        results[idx] ||
-        {};
-
-
-    results[idx].status =
-        select.value;
-
-
-    if (
-        select.value ===
-        "Sin excepción"
-    ) {
-
-        const registeredInput =
-            document.querySelector(
-                '.res-registered[data-idx="' +
-                idx +
-                '"]'
-            );
-
-
-        const validatedInput =
-            document.querySelector(
-                '.res-validated[data-idx="' +
-                idx +
-                '"]'
-            );
-
-
-        if (
-            registeredInput &&
-            validatedInput &&
-            registeredInput.value !== ""
-        ) {
-
-            validatedInput.value =
-                registeredInput.value;
-
-
-            results[idx].registered =
-                parseNumberOrBlank(
-                    registeredInput.value
-                );
-
-
-            results[idx].validated =
-                parseNumberOrBlank(
-                    registeredInput.value
-                );
-
-
-            results[idx].difference =
-                0;
-
-
-            const diffCell =
-                document.querySelector(
-                    '.res-diff[data-idx="' +
-                    idx +
-                    '"]'
-                );
-
-
-            if (
-                diffCell
-            ) {
-
-                diffCell.textContent =
-                    formatDifference(
-                        0
-                    );
-            }
-        }
-    }
-
-
-    updateResultsDashboard();
-}
-
-
-// =========================================================
-// DIFERENCIA
-// =========================================================
-
-function calcDiff(e) {
-
-    const idx =
-        String(
-            e.target.dataset.idx
-        );
-
-
-    const registeredInput =
-        document.querySelector(
-            '.res-registered[data-idx="' +
-            idx +
-            '"]'
-        );
-
-
-    const validatedInput =
-        document.querySelector(
-            '.res-validated[data-idx="' +
-            idx +
-            '"]'
-        );
-
-
-    if (
-        !registeredInput ||
-        !validatedInput
-    ) {
-
-        return;
-    }
-
-
-    const registered =
-        parseNumberOrBlank(
-            registeredInput.value
-        );
-
-
-    const validated =
-        parseNumberOrBlank(
-            validatedInput.value
-        );
-
-
-    results[idx] =
-        results[idx] ||
-        {};
-
-
-    results[idx].registered =
-        registered;
-
-
-    results[idx].validated =
-        validated;
-
-
-    const diffCell =
-        document.querySelector(
-            '.res-diff[data-idx="' +
-            idx +
-            '"]'
-        );
-
-
-    if (
-        registered === "" ||
-        validated === ""
-    ) {
-
-        results[idx].difference =
-            "";
-
-
-        if (
-            diffCell
-        ) {
-
-            diffCell.textContent =
-                "";
-        }
-
-
-        updateResultsDashboard();
-
-        return;
-    }
-
-
-    const difference =
-
-        Number(
-            registered
-        )
-
-        -
-
-        Number(
-            validated
-        );
-
-
-    results[idx].difference =
-        difference;
-
-
-    if (
-        diffCell
-    ) {
-
-        diffCell.textContent =
-            formatDifference(
-                difference
-            );
-    }
-
-
-    updateResultsDashboard();
-}
-
-
-// =========================================================
-// DASHBOARD RESULTADOS
-// =========================================================
-
-function updateResultsDashboard() {
-
-    const dash =
-        document.getElementById(
-            "resultsDash"
-        );
-
-
-    if (
-        !dash
-    ) {
-
-        return;
-    }
-
-
-    if (
-        !sample.length
-    ) {
-
-        dash.innerHTML =
-            "";
-
-        return;
-    }
-
-
-    let reviewed = 0;
-    let exceptions = 0;
-    let pending = 0;
-    let observedError = 0;
-
-
-    sample.forEach(
-        (
-            row,
-            i
-        ) => {
-
-            const idx =
-                String(
-                    getOriginalIndex(
-                        row,
-                        i
-                    )
-                );
-
-
-            const res =
-                results[idx] ||
-                {};
-
-
-            if (
-                !res.status
-            ) {
-
-                pending++;
-
-                return;
-            }
-
-
-            reviewed++;
-
-
-            if (
-                res.status ===
-                    "Excepción monetaria"
-
-                ||
-
-                res.status ===
-                    "Excepción no monetaria"
-            ) {
-
-                exceptions++;
-            }
-
-
-            if (
-                res.difference !== "" &&
-                res.difference !== undefined &&
-                res.difference !== null
-            ) {
-
-                observedError +=
-
-                    Math.abs(
-                        Number(
-                            res.difference
-                        ) || 0
-                    );
-            }
-        }
-    );
-
-
-    dash.innerHTML =
-
-        kpiCard(
-            "Total muestra",
-            sample.length
-        ) +
-
-        kpiCard(
-            "Revisados",
-            reviewed
-        ) +
-
-        kpiCard(
-            "Pendientes",
-            pending
-        ) +
-
-        kpiCard(
-            "Excepciones",
-            exceptions
-        ) +
-
-        kpiCard(
-            "Error monetario observado",
-            formatMoney(
-                observedError
-            )
-        );
-}
-
-
-// =========================================================
-// GUARDAR RESULTADOS
-// =========================================================
-
-document
-    .getElementById(
-        "saveResults"
+    return result
+
+def sample_size(N, confidence, error, p):
+    z_map = {'90': 1.645, '95': 1.96, '97': 2.17, '99': 2.576}
+    z = z_map.get(str(confidence), 1.96)
+    q = 1 - p
+    if N <= 0 or error <= 0:
+        return (0, z, q)
+    n = z * z * p * q * N / (error * error * (N - 1) + z * z * p * q)
+    return (int(math.ceil(n)), z, q)
+
+def selection_signature(params, seed=None):
+    return (str(params.get('id_col', '')), str(params.get('amount_col', '')), str(params.get('method', '')), int(params.get('n', 0) or 0), bool(params.get('include_materiality')), bool(params.get('include_outliers')), float(params.get('significant_threshold', 0) or 0), int(seed if seed is not None else params.get('seed') or 0))
+
+def add_selection(base, idx, reason, method, selection_type, stratum):
+    if len(idx) == 0:
+        return pd.DataFrame()
+    out = base.loc[idx].copy()
+    out['_original_index'] = out.index.astype(int)
+    out['Motivo de selección'] = reason
+    out['Método'] = method
+    out['Tipo_Seleccion'] = selection_type
+    out['Estrato'] = stratum
+    return out
+
+
+def make_sample(df, params):
+    id_col = params.get('id_col')
+    amount_col = params.get('amount_col')
+    method = params.get('method', 'random')
+    seed = int(
+        params.get('seed')
+        or np.random.randint(1, 2 ** 31 - 1)
     )
-    .onclick =
-        async () => {
 
-            if (
-                !sample.length
-            ) {
+    rng = np.random.default_rng(seed)
+    n = int(params.get('n', 0) or 0)
 
-                alert(
-                    "Genere muestra primero."
-                );
+    if df is None or df.empty:
+        return pd.DataFrame(), seed
 
-                return;
-            }
-
-
-            collectVisibleResults();
-
-
-            const payloadResults =
-
-                sample.map(
-                    (
-                        row,
-                        i
-                    ) => {
-
-                        const idx =
-                            String(
-                                getOriginalIndex(
-                                    row,
-                                    i
-                                )
-                            );
-
-
-                        const res =
-                            results[idx] ||
-                            {};
-
-
-                        return {
-
-                            _original_index:
-                                Number(idx),
-
-                            status:
-                                res.status ||
-                                "",
-
-                            registered:
-
-                                res.registered !== undefined
-
-                                    ? res.registered
-
-                                    : "",
-
-                            validated:
-
-                                res.validated !== undefined
-
-                                    ? res.validated
-
-                                    : "",
-
-                            audited:
-
-                                res.registered !== undefined
-
-                                    ? res.registered
-
-                                    : "",
-
-                            correct:
-
-                                res.validated !== undefined
-
-                                    ? res.validated
-
-                                    : "",
-
-                            difference:
-
-                                Number(
-                                    res.difference
-                                ) || 0,
-
-                            exception_type:
-                                res.exception_type ||
-                                "",
-
-                            comment:
-                                res.comment ||
-                                "",
-
-                            evidence:
-                                res.evidence ||
-                                ""
-                        };
-                    }
-                );
-
-
-            const r =
-                await fetch(
-                    "/api/results",
-                    {
-                        method:
-                            "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body:
-                            JSON.stringify({
-                                results:
-                                    payloadResults
-                            })
-                    }
-                );
-
-
-            const j =
-                await r.json();
-
-
-            if (
-                !r.ok ||
-                j.error
-            ) {
-
-                if (
-                    j.conflict
-                ) {
-
-                    alert(
-                        j.error +
-                        "\n\nVolvé a abrir el trabajo antes de continuar."
-                    );
-
-                } else {
-
-                    alert(
-                        j.error ||
-                        "No se pudieron guardar los resultados."
-                    );
-                }
-
-                return;
-            }
-
-
-            alert(
-                "Resultados guardados."
-            );
-
-
-            updateResultsDashboard();
-
-            await updateExtrapolation();
-        };
-
-
-// =========================================================
-// RECOLECTAR RESULTADOS
-// =========================================================
-
-function collectVisibleResults() {
-
-    document
-        .querySelectorAll(
-            ".res-status"
+    if amount_col and amount_col in df.columns:
+        amount = parse_amount(
+            df[amount_col]
+        ).fillna(0)
+    else:
+        amount = pd.Series(
+            0.0,
+            index=df.index
         )
-        .forEach(
-            el => {
 
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].status =
-                    el.value;
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-registered"
-        )
-        .forEach(
-            el => {
-
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].registered =
-                    parseNumberOrBlank(
-                        el.value
-                    );
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-validated"
-        )
-        .forEach(
-            el => {
-
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].validated =
-                    parseNumberOrBlank(
-                        el.value
-                    );
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-exception-type"
-        )
-        .forEach(
-            el => {
-
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].exception_type =
-                    el.value;
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-comment"
-        )
-        .forEach(
-            el => {
-
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].comment =
-                    el.value;
-            }
-        );
-
-
-    document
-        .querySelectorAll(
-            ".res-evidence"
-        )
-        .forEach(
-            el => {
-
-                const idx =
-                    String(
-                        el.dataset.idx
-                    );
-
-
-                results[idx] =
-                    results[idx] ||
-                    {};
-
-
-                results[idx].evidence =
-                    el.value;
-            }
-        );
-}
-
-
-// =========================================================
-// DESCARGAR HOJA DE REVISIÓN
-// =========================================================
-
-const downloadReview =
-    document.getElementById(
-        "downloadReview"
-    );
-
-
-if (
-    downloadReview
-) {
-
-    downloadReview.onclick =
-        () => {
-
-            if (
-                !sample.length
-            ) {
-
-                alert(
-                    "Genere primero una muestra."
-                );
-
-                return;
-            }
-
-
-            window.location.href =
-                "/api/review-template";
-        };
-}
-
-
-// =========================================================
-// IMPORTAR EXCEL DE REVISIÓN
-// =========================================================
-
-const importReview =
-    document.getElementById(
-        "importReview"
-    );
-
-
-const reviewFile =
-    document.getElementById(
-        "reviewFile"
-    );
-
-
-if (
-    importReview &&
-    reviewFile
-) {
-
-    importReview.onclick =
-        () => {
-
-            if (
-                !sample.length
-            ) {
-
-                alert(
-                    "Genere primero una muestra."
-                );
-
-                return;
-            }
-
-
-            reviewFile.click();
-        };
-
-
-    reviewFile.onchange =
-        async e => {
-
-            const f =
-                e.target.files[0];
-
-
-            if (
-                !f
-            ) {
-
-                return;
-            }
-
-
-            const fd =
-                new FormData();
-
-
-            fd.append(
-                "file",
-                f
-            );
-
-
-            try {
-
-                const r =
-                    await fetch(
-                        "/api/import-results",
-                        {
-                            method:
-                                "POST",
-
-                            body:
-                                fd
-                        }
-                    );
-
-
-                const j =
-                    await r.json();
-
-
-                if (
-                    !r.ok ||
-                    j.error
-                ) {
-
-                    if (
-                        j.conflict
-                    ) {
-
-                        alert(
-                            j.error +
-                            "\n\nVolvé a abrir el trabajo antes de continuar."
-                        );
-
-                    } else {
-
-                        alert(
-                            j.error ||
-                            "No se pudo importar el archivo."
-                        );
-                    }
-
-                    return;
-                }
-
-
-                if (
-                    Array.isArray(
-                        j.results
-                    )
-                ) {
-
-                    j.results.forEach(
-                        item => {
-
-                            const idx =
-                                String(
-                                    item._original_index
-                                );
-
-
-                            results[idx] = {
-
-                                status:
-                                    item.status ||
-                                    "",
-
-                                registered:
-
-                                    item.registered !== undefined
-
-                                        ? item.registered
-
-                                        : "",
-
-                                validated:
-
-                                    item.validated !== undefined
-
-                                        ? item.validated
-
-                                        : "",
-
-                                difference:
-
-                                    item.difference !== undefined
-
-                                        ? item.difference
-
-                                        : "",
-
-                                exception_type:
-                                    item.exception_type ||
-                                    "",
-
-                                comment:
-                                    item.comment ||
-                                    "",
-
-                                evidence:
-                                    item.evidence ||
-                                    ""
-                            };
-                        }
-                    );
-                }
-
-
-                renderResultsTable();
-
-
-                let message =
-
-                    "Se importaron " +
-
-                    (
-                        j.imported ||
-                        0
-                    ) +
-
-                    " resultados.";
-
-
-                if (
-                    j.missing_from_file
-                ) {
-
-                    message +=
-
-                        "\n" +
-
-                        j.missing_from_file +
-
-                        " registros de la muestra no estaban en el Excel.";
-                }
-
-
-                alert(
-                    message
-                );
-
-
-                await updateExtrapolation();
-
-
-            } catch (err) {
-
-                alert(
-                    "Error al importar: " +
-                    err.message
-                );
-            }
-
-
-            reviewFile.value =
-                "";
-        };
-}
-
-
-// =========================================================
-// EXTRAPOLACIÓN
-// =========================================================
-
-document
-    .getElementById(
-        "refreshExtra"
+    selected = []
+    excluded = np.zeros(
+        len(df),
+        dtype=bool
     )
-    .onclick =
-        updateExtrapolation;
 
+    def append_selection(
+        indices,
+        reason,
+        method_name,
+        selection_type,
+        stratum
+    ):
+        indices = np.asarray(
+            list(indices),
+            dtype=np.int64
+        )
 
-async function updateExtrapolation() {
+        if len(indices) == 0:
+            return
 
-    const r =
-        await fetch(
-            "/api/extrapolation"
-        );
+        selected.append(
+            (
+                indices,
+                reason,
+                method_name,
+                selection_type,
+                stratum
+            )
+        )
 
+        excluded[indices] = True
 
-    const j =
-        await r.json();
-
+    threshold = float(
+        params.get('significant_threshold') or 0
+    )
 
     if (
-        !r.ok ||
-        j.error
-    ) {
+        params.get('include_materiality')
+        and threshold > 0
+    ):
+        idx = amount.index[
+            amount.abs() >= threshold
+        ].to_numpy(dtype=np.int64)
 
-        document
-            .getElementById(
-                "extraWarning"
+        append_selection(
+            idx,
+            'Partida significativa',
+            'Revisión 100%',
+            'Dirigida_100',
+            '100%'
+        )
+
+    if params.get('include_outliers'):
+        available_idx = np.flatnonzero(
+            ~excluded
+        )
+
+        if len(available_idx):
+            x = amount.iloc[
+                available_idx
+            ]
+
+            q1 = x.quantile(0.25)
+            q3 = x.quantile(0.75)
+            iqr = q3 - q1
+
+            lower = q1 - 3 * iqr
+            upper = q3 + 3 * iqr
+
+            idx = x.index[
+                (x < lower) | (x > upper)
+            ].to_numpy(dtype=np.int64)
+
+            append_selection(
+                idx,
+                'Valor atípico',
+                'Revisión 100%',
+                'Dirigida_100',
+                '100%'
             )
-            .innerHTML =
 
-                '<div class="warning-box">' +
+    residual_idx = np.flatnonzero(
+        ~excluded
+    )
 
-                escapeHtml(
-                    j.error ||
-                    "No se pudo calcular la extrapolación."
-                ) +
+    n = min(
+        n,
+        len(residual_idx)
+    )
 
-                '</div>';
+    if n > 0 and method == 'random':
+        idx = rng.choice(
+            residual_idx,
+            size=n,
+            replace=False
+        )
+
+        append_selection(
+            idx,
+            'Selección aleatoria',
+            'Aleatorio simple',
+            'Probabilistica',
+            'Probabilístico'
+        )
+
+    elif n > 0 and method == 'systematic':
+        if id_col and id_col in df.columns:
+            ordered_idx = (
+                df.iloc[residual_idx][id_col]
+                .sort_values(kind='mergesort')
+                .index
+                .to_numpy(dtype=np.int64)
+            )
+        else:
+            ordered_idx = residual_idx
+
+        interval = len(ordered_idx) / n
+        start = rng.uniform(0, interval)
+
+        positions = np.floor(
+            start + np.arange(n) * interval
+        ).astype(int)
+
+        positions = np.clip(
+            positions,
+            0,
+            len(ordered_idx) - 1
+        )
+
+        idx = ordered_idx[positions]
+
+        append_selection(
+            idx,
+            'Selección sistemática',
+            'Sistemático',
+            'Probabilistica',
+            'Probabilístico'
+        )
+
+    elif n > 0 and method == 'mus':
+        positive_idx = residual_idx[
+            amount.iloc[residual_idx]
+            .to_numpy() > 0
+        ]
+
+        if len(positive_idx):
+            positive_values = amount.iloc[
+                positive_idx
+            ]
+
+            total_positive = float(
+                positive_values.sum()
+            )
+
+            if total_positive > 0:
+                interval = total_positive / n
+                start = rng.uniform(
+                    0,
+                    interval
+                )
+
+                points = (
+                    start
+                    + np.arange(n) * interval
+                )
+
+                cumulative = (
+                    positive_values
+                    .cumsum()
+                    .to_numpy()
+                )
+
+                locations = np.searchsorted(
+                    cumulative,
+                    points,
+                    side='left'
+                )
+
+                locations = np.clip(
+                    locations,
+                    0,
+                    len(positive_idx) - 1
+                )
+
+                idx = positive_idx[
+                    np.unique(locations)
+                ]
+
+                append_selection(
+                    idx,
+                    'Selección por unidad monetaria',
+                    'MUS / PPS',
+                    'Probabilistica',
+                    'Probabilístico'
+                )
+
+    elif n > 0 and method == 'topn':
+        idx = (
+            amount.iloc[residual_idx]
+            .abs()
+            .nlargest(n)
+            .index
+            .to_numpy(dtype=np.int64)
+        )
+
+        append_selection(
+            idx,
+            'Mayores importes',
+            'Top N',
+            'Dirigida',
+            'Dirigido'
+        )
+
+    elif n > 0 and method == 'stratified':
+        values = amount.iloc[
+            residual_idx
+        ].abs()
+
+        q50 = values.quantile(0.50)
+        q90 = values.quantile(0.90)
+
+        if q50 == q90:
+            idx = rng.choice(
+                residual_idx,
+                size=n,
+                replace=False
+            )
+
+            append_selection(
+                idx,
+                'Selección estratificada',
+                'Estratificado',
+                'Probabilistica',
+                'Probabilístico'
+            )
+
+        else:
+            strata = [
+                values.index[
+                    values <= q50
+                ].to_numpy(dtype=np.int64),
+
+                values.index[
+                    (values > q50)
+                    & (values <= q90)
+                ].to_numpy(dtype=np.int64),
+
+                values.index[
+                    values > q90
+                ].to_numpy(dtype=np.int64)
+            ]
+
+            picks = []
+
+            for group in strata:
+                if len(group) == 0:
+                    continue
+
+                take = min(
+                    len(group),
+                    max(
+                        1,
+                        round(
+                            n
+                            * len(group)
+                            / len(residual_idx)
+                        )
+                    )
+                )
+
+                picks.extend(
+                    rng.choice(
+                        group,
+                        size=take,
+                        replace=False
+                    ).tolist()
+                )
+
+            picks = list(
+                dict.fromkeys(picks)
+            )
+
+            if len(picks) > n:
+                picks = rng.choice(
+                    np.array(picks),
+                    size=n,
+                    replace=False
+                ).tolist()
+
+            if len(picks) < n:
+                remaining = np.setdiff1d(
+                    residual_idx,
+                    np.array(
+                        picks,
+                        dtype=np.int64
+                    ),
+                    assume_unique=False
+                )
+
+                extra = min(
+                    n - len(picks),
+                    len(remaining)
+                )
+
+                if extra:
+                    picks.extend(
+                        rng.choice(
+                            remaining,
+                            size=extra,
+                            replace=False
+                        ).tolist()
+                    )
+
+            append_selection(
+                picks[:n],
+                'Selección estratificada',
+                'Estratificado',
+                'Probabilistica',
+                'Probabilístico'
+            )
+
+    if not selected:
+        return pd.DataFrame(), seed
+
+    frames = []
+
+    for (
+        indices,
+        reason,
+        method_name,
+        selection_type,
+        stratum
+    ) in selected:
+        frame = add_selection(
+            df,
+            indices,
+            reason,
+            method_name,
+            selection_type,
+            stratum
+        )
+
+        frame['_amount_numeric'] = (
+            amount.loc[frame.index]
+            .to_numpy()
+        )
+
+        frames.append(frame)
+
+    out = pd.concat(
+        frames,
+        ignore_index=False
+    )
+
+    out = out.drop_duplicates(
+        subset=['_original_index'],
+        keep='first'
+    )
+
+    return out, seed
+
+def normalize_result(item):
+    idx = item.get('_original_index')
+    if idx is None:
+        return None
+    try:
+        idx = int(idx)
+    except Exception:
+        return None
+
+    def number_or_blank(value):
+        if value in ('', None):
+            return ''
+        try:
+            return float(value)
+        except Exception:
+            return ''
+    registered = number_or_blank(item.get('registered', item.get('audited', '')))
+    validated = number_or_blank(item.get('validated', item.get('correct', '')))
+    if registered != '' and validated != '':
+        difference = registered - validated
+    else:
+        try:
+            difference = float(item.get('difference', 0) or 0)
+        except Exception:
+            difference = 0.0
+    return {'_original_index': idx, 'status': str(item.get('status', '') or '').strip(), 'registered': registered, 'validated': validated, 'difference': float(difference), 'exception_type': str(item.get('exception_type', '') or '').strip(), 'comment': str(item.get('comment', '') or '').strip(), 'evidence': str(item.get('evidence', '') or '').strip()}
+
+def get_audit_rows(project):
+    sample = project.get('sample', pd.DataFrame())
+    results = project.get('audit_results', {})
+    if sample.empty:
+        return []
+    rows = []
+    for _, row in sample.iterrows():
+        idx = int(row['_original_index'])
+        result = results.get(str(idx), {})
+        rows.append({'_original_index': idx, 'Estrato': row.get('Estrato', ''), 'Método': row.get('Método', ''), 'Motivo de selección': row.get('Motivo de selección', ''), 'Resultado de revisión': result.get('status', ''), 'Importe registrado': result.get('registered', ''), 'Importe validado': result.get('validated', ''), 'Diferencia': result.get('difference', ''), 'Tipo de excepción': result.get('exception_type', ''), 'Comentario del auditor': result.get('comment', ''), 'Referencia de evidencia': result.get('evidence', '')})
+    return rows
 
 
-        return;
+def calculate_extrapolation(project):
+    sample = project.get('sample', pd.DataFrame())
+    params = project.get('params', {})
+    results = project.get('audit_results', {})
+
+    amount_col = params.get('amount_col')
+    id_col = params.get('id_col')
+
+    if sample.empty:
+        raise ValueError('No existe muestra generada')
+
+    df = analysis_dataframe(
+        project,
+        id_col,
+        amount_col
+    )
+
+    if not amount_col or amount_col not in df.columns:
+        raise ValueError(
+            'No se encuentra la columna de importe configurada'
+        )
+
+    total_population = float(
+        parse_amount(
+            df[amount_col]
+        )
+        .fillna(0)
+        .abs()
+        .sum()
+    )
+
+    s = sample.copy()
+
+    if '_amount_numeric' not in s.columns:
+        s['_amount_numeric'] = parse_amount(
+            s[amount_col]
+        ).fillna(0)
+
+    s['_amount_abs'] = (
+        s['_amount_numeric']
+        .abs()
+    )
+
+    s['error'] = [
+        float(
+            results
+            .get(str(int(index)), {})
+            .get('difference', 0)
+            or 0
+        )
+        for index in s['_original_index']
+    ]
+
+    s['status'] = [
+        results
+        .get(str(int(index)), {})
+        .get('status', '')
+        for index in s['_original_index']
+    ]
+
+    if 'Tipo_Seleccion' in s.columns:
+        hundred = s[
+            s['Tipo_Seleccion'] == 'Dirigida_100'
+        ]
+
+        prob = s[
+            s['Tipo_Seleccion'] == 'Probabilistica'
+        ]
+
+        directed = s[
+            s['Tipo_Seleccion'] == 'Dirigida'
+        ]
+
+    else:
+        norm = (
+            s.get(
+                'Estrato',
+                pd.Series('', index=s.index)
+            )
+            .astype(str)
+            .str.lower()
+        )
+
+        hundred = s[
+            norm.eq('100%')
+        ]
+
+        prob = s[
+            norm.str.contains(
+                'probabil',
+                na=False
+            )
+        ]
+
+        directed = s[
+            ~s.index.isin(hundred.index)
+            & ~s.index.isin(prob.index)
+        ]
+
+    observed_100 = float(
+        hundred['error'].abs().sum()
+    )
+
+    observed_prob = float(
+        prob['error'].abs().sum()
+    )
+
+    directed_observed = float(
+        directed['error'].abs().sum()
+    )
+
+    prob_sample_amount = float(
+        prob['_amount_abs'].sum()
+    )
+
+    excluded_ids = set(
+        hundred['_original_index']
+        .astype(int)
+        .tolist()
+    )
+
+    excluded_ids.update(
+        directed['_original_index']
+        .astype(int)
+        .tolist()
+    )
+
+    amount_series = parse_amount(
+        df[amount_col]
+    ).fillna(0)
+
+    if excluded_ids:
+        keep_mask = ~df.index.isin(
+            excluded_ids
+        )
+
+        residual_population = float(
+            amount_series.loc[
+                keep_mask
+            ]
+            .abs()
+            .sum()
+        )
+
+    else:
+        residual_population = float(
+            amount_series
+            .abs()
+            .sum()
+        )
+
+    error_rate = (
+        observed_prob / prob_sample_amount
+        if prob_sample_amount
+        else 0.0
+    )
+
+    projected = (
+        error_rate * residual_population
+        if len(prob)
+        else None
+    )
+
+    identified = (
+        observed_100
+        + observed_prob
+        + directed_observed
+    )
+
+    total_estimated = (
+        observed_100
+        + directed_observed
+        + (projected or 0)
+    )
+
+    exception_statuses = {
+        'Excepción monetaria',
+        'Excepción no monetaria',
+        'Excepción',
+        'Error monetario',
+        'Error no monetario'
     }
 
+    exceptions = int(
+        s['status']
+        .isin(exception_statuses)
+        .sum()
+    )
 
-    document
-        .getElementById(
-            "extraWarning"
+    materiality = float(
+        params.get('materiality') or 0
+    )
+
+    tolerable = float(
+        params.get('tolerable_error') or 0
+    )
+
+    def traffic(value, limit):
+        if not limit:
+            return 'sin umbral'
+
+        ratio = abs(value) / abs(limit)
+
+        if ratio < 0.8:
+            return 'verde'
+
+        if ratio <= 1:
+            return 'amarillo'
+
+        return 'rojo'
+
+    method = params.get('method', '')
+    message = None
+
+    if not len(prob):
+        message = (
+            'La muestra no contiene registros probabilísticos. '
+            'Las selecciones dirigidas o revisadas al 100% '
+            'no deben extrapolarse estadísticamente.'
         )
-        .innerHTML =
 
-            j.message
-
-                ? (
-                    '<div class="warning-box">' +
-
-                    escapeHtml(
-                        j.message
-                    ) +
-
-                    '</div>'
-                )
-
-                : "";
-
-
-    document
-        .getElementById(
-            "observed"
+    elif method == 'mus':
+        message = (
+            'La muestra MUS/PPS es probabilística. '
+            'La proyección mostrada es una estimación proporcional '
+            'simplificada; una evaluación MUS formal requiere '
+            'su metodología específica.'
         )
-        .innerHTML =
 
-            observedItem(
-                "Error detectado en revisión 100%",
-                formatMoney(
-                    j.observed_100 ||
-                    0
-                )
-            ) +
-
-            observedItem(
-                "Error detectado en muestra probabilística",
-                formatMoney(
-                    j.observed_residual ||
-                    0
-                )
-            ) +
-
-            observedItem(
-                "Total de errores efectivamente detectados",
-                formatMoney(
-                    j.effectively_identified ||
-                    0
-                )
-            );
-
-
-    document
-        .getElementById(
-            "projected"
-        )
-        .innerHTML =
-
-            projectedItem(
-                "Tasa de error observada",
-
-                (
-                    (
-                        j.error_rate ||
-                        0
-                    )
-
-                    *
-
-                    100
-                ).toFixed(2)
-
-                +
-
-                "%"
-            ) +
-
-            projectedItem(
-                "Error estimado en el universo probabilístico",
-
-                formatMoney(
-                    j.projected_residual ||
-                    0
-                )
-            ) +
-
-            projectedItem(
-                "Error total estimado de la población",
-
-                formatMoney(
-                    j.total_estimated ||
-                    0
-                )
-            );
-
-
-    document
-        .getElementById(
-            "summary"
-        )
-        .innerHTML =
-
-            executiveKpi(
-                "Muestra",
-                (
-                    j.sample_count ||
-                    0
-                ).toLocaleString()
-            ) +
-
-            executiveKpi(
-                "Cobertura registros",
-                (
-                    j.coverage_count ||
-                    0
-                ).toFixed(2) +
-                "%"
-            ) +
-
-            executiveKpi(
-                "Excepciones",
-                j.exceptions ||
-                0
-            ) +
-
-            executiveKpi(
-                "Error observado",
-
-                formatMoney(
-                    (
-                        j.observed_100 ||
-                        0
-                    )
-
-                    +
-
-                    (
-                        j.observed_residual ||
-                        0
-                    )
-                )
-            ) +
-
-            executiveKpi(
-                "Error estimado universo probabilístico",
-
-                formatMoney(
-                    j.projected_residual ||
-                    0
-                )
-            ) +
-
-            executiveKpi(
-                "Error total estimado",
-
-                formatMoney(
-                    j.total_estimated ||
-                    0
-                )
-            );
-
-
-    const materiality =
-        j.materiality ||
-        0;
-
-
-    const checks =
-        j.checks ||
-        {};
-
-
-    document
-        .getElementById(
-            "conclusion"
-        )
-        .innerHTML =
-
-            '<p>' +
-
-            'Error total estimado de la población: ' +
-
-            '<strong>' +
-
-            formatMoney(
-                j.total_estimated ||
-                0
-            ) +
-
-            '</strong>. ' +
-
-            'Materialidad: ' +
-
-            '<strong>' +
-
-            formatMoney(
+    return {
+        'extrapolable': bool(len(prob)),
+        'message': message,
+        'method': method,
+        'total_population': total_population,
+        'hundred_population': float(
+            hundred['_amount_abs'].sum()
+        ),
+        'residual_population': residual_population,
+        'probabilistic_sample_amount': prob_sample_amount,
+        'probabilistic_sample_count': int(len(prob)),
+        'hundred_count': int(len(hundred)),
+        'directed_count': int(len(directed)),
+        'observed_100': observed_100,
+        'observed_residual': observed_prob,
+        'directed_observed': directed_observed,
+        'effectively_identified': identified,
+        'error_rate': error_rate,
+        'projected_residual': projected,
+        'total_estimated': total_estimated,
+        'exceptions': exceptions,
+        'sample_count': int(len(sample)),
+        'coverage_count': (
+            len(sample) / len(df) * 100
+            if len(df)
+            else 0
+        ),
+        'coverage_amount': (
+            float(s['_amount_abs'].sum())
+            / total_population
+            * 100
+            if total_population
+            else 0
+        ),
+        'materiality': materiality,
+        'tolerable_error': tolerable,
+        'checks': {
+            'observed_vs_materiality': traffic(
+                identified,
                 materiality
-            ) +
-
-            '</strong>. ' +
-
-            'Estado: ' +
-
-            '<strong>' +
-
-            escapeHtml(
-                checks.total_vs_materiality ||
-                "sin umbral"
-            ) +
-
-            '</strong>.' +
-
-            '</p>';
-}
-
-
-function observedItem(
-    label,
-    value
-) {
-
-    return (
-
-        '<div class="obs-item">' +
-
-            '<span class="obs-label">' +
-                label +
-            '</span>' +
-
-            '<span class="obs-value">' +
-                value +
-            '</span>' +
-
-        '</div>'
-    );
-}
-
-
-function projectedItem(
-    label,
-    value
-) {
-
-    return (
-
-        '<div class="proj-item">' +
-
-            '<span class="proj-label">' +
-                label +
-            '</span>' +
-
-            '<span class="proj-value">' +
-                value +
-            '</span>' +
-
-        '</div>'
-    );
-}
-
-
-function executiveKpi(
-    label,
-    value
-) {
-
-    return (
-
-        '<div class="exec-kpi">' +
-
-            '<div class="exec-kpi-label">' +
-                label +
-            '</div>' +
-
-            '<div class="exec-kpi-value">' +
-                value +
-            '</div>' +
-
-        '</div>'
-    );
-}
-
-
-// =========================================================
-// FUNCIONES AUXILIARES
-// =========================================================
-
-function optionSelected(
-    value,
-    label,
-    selectedValue
-) {
-
-    return (
-
-        '<option value="' +
-        escapeAttribute(
-            value
-        ) +
-        '"' +
-
-        (
-            value === selectedValue
-
-                ? " selected"
-
-                : ""
-        ) +
-
-        '>' +
-
-        escapeHtml(
-            label
-        ) +
-
-        '</option>'
-    );
-}
-
-
-function parseNumberOrBlank(
-    value
-) {
-
-    if (
-        value === "" ||
-        value === null ||
-        value === undefined
-    ) {
-
-        return "";
-    }
-
-
-    const number =
-        Number(
-            value
-        );
-
-
-    return Number.isFinite(
-        number
-    )
-
-        ? number
-
-        : "";
-}
-
-
-function formatDifference(
-    value
-) {
-
-    if (
-        value === "" ||
-        value === undefined ||
-        value === null
-    ) {
-
-        return "";
-    }
-
-
-    return formatMoney(
-        value
-    );
-}
-
-
-function safeInputValue(
-    value
-) {
-
-    if (
-        value === null ||
-        value === undefined ||
-        value === ""
-    ) {
-
-        return "";
-    }
-
-
-    const number =
-        Number(
-            value
-        );
-
-
-    if (
-        Number.isFinite(
-            number
-        )
-    ) {
-
-        return number;
-    }
-
-
-    return "";
-}
-
-
-function displayValue(
-    value
-) {
-
-    if (
-        value === null ||
-        value === undefined
-    ) {
-
-        return "";
-    }
-
-
-    return String(
-        value
-    );
-}
-
-
-function escapeHtml(
-    value
-) {
-
-    return String(
-        value === undefined ||
-        value === null
-            ? ""
-            : value
-    )
-    .replaceAll(
-        "&",
-        "&amp;"
-    )
-    .replaceAll(
-        "<",
-        "&lt;"
-    )
-    .replaceAll(
-        ">",
-        "&gt;"
-    )
-    .replaceAll(
-        '"',
-        "&quot;"
-    )
-    .replaceAll(
-        "'",
-        "&#039;"
-    );
-}
-
-
-function escapeAttribute(
-    value
-) {
-
-    return escapeHtml(
-        value
-    );
-}
-
-
-// =========================================================
-// FORMATO MONETARIO
-// =========================================================
-
-function formatMoney(
-    value
-) {
-
-    const number =
-        Number(
-            value
-        ) || 0;
-
-
-    return new Intl.NumberFormat(
-        "es-AR",
-        {
-            style:
-                "currency",
-
-            currency:
-                "ARS",
-
-            minimumFractionDigits:
-                0,
-
-            maximumFractionDigits:
-                2
+            ),
+            'projected_vs_materiality': traffic(
+                projected or 0,
+                materiality
+            ),
+            'total_vs_materiality': traffic(
+                total_estimated,
+                materiality
+            ),
+            'projected_vs_tolerable': traffic(
+                projected or 0,
+                tolerable
+            )
         }
+    }
+
+@app.route('/api/work/db-status', methods=['GET'])
+def work_db_status():
+    if not database_available():
+        return jsonify(configured=False, available=False, message='DATABASE_URL no está configurada.')
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1')
+                cur.fetchone()
+        return jsonify(configured=True, available=True)
+    except Exception as exc:
+        return (jsonify(configured=True, available=False, message=str(exc)), 503)
+
+@app.route('/api/work/current', methods=['GET'])
+def current_work():
+    project = get_project()
+    return jsonify(project_state_payload(project))
+
+@app.route('/api/work/create', methods=['POST'])
+def create_work():
+    project = get_project()
+    data = request.json or {}
+    if project.get('work_code'):
+        return (jsonify(error='Ya hay un trabajo persistente abierto. Cerralo antes de crear uno nuevo.'), 400)
+    try:
+        work_code, access_key = create_persistent_work(project, data.get('name'), data.get('responsible'))
+    except (ValueError, RuntimeError) as exc:
+        return (jsonify(error=str(exc)), 400)
+    except Exception as exc:
+        return (jsonify(error='No se pudo crear el trabajo en PostgreSQL: ' + str(exc)), 500)
+    session['work_code'] = work_code
+    return jsonify(created=True, work_code=work_code, access_key=access_key, message='Trabajo creado. Guardá el Código de trabajo y la Clave de acceso.', state=project_state_payload(project))
+
+@app.route('/api/work/open', methods=['POST'])
+def open_work():
+    data = request.json or {}
+    work_code = str(data.get('work_code') or '').strip().upper()
+    access_key = str(data.get('access_key') or '').strip().upper()
+    if not work_code or not access_key:
+        return (jsonify(error='Ingresá el Código de trabajo y la Clave de acceso.'), 400)
+    try:
+        row = fetch_work_record(work_code)
+    except Exception as exc:
+        return (jsonify(error='No se pudo consultar PostgreSQL: ' + str(exc)), 500)
+    if not row:
+        return (jsonify(error='No se encontró el Código de trabajo.'), 404)
+    if not check_password_hash(row['access_key_hash'], access_key):
+        return (jsonify(error='La Clave de acceso es incorrecta.'), 403)
+    project = record_to_project(row)
+    pid = str(uuid.uuid4())
+    projects[pid] = project
+    session['project_id'] = pid
+    session['work_code'] = project['work_code']
+    try:
+        log_event(project, 'Trabajo abierto', {'source': 'web'})
+    except Exception as exc:
+        print('No se pudo registrar el evento de apertura:', exc)
+    return jsonify(opened=True, state=project_state_payload(project))
+
+@app.route('/api/work/save', methods=['POST'])
+def save_work():
+    project = get_project()
+    if not project.get('work_code'):
+        return (jsonify(error='Este es un trabajo temporal. Creá un Código de trabajo para guardarlo.'), 400)
+    try:
+        persist_project(project, 'Guardado manual')
+    except WorkConflictError as exc:
+        return (jsonify(error=str(exc), conflict=True), 409)
+    except Exception as exc:
+        return (jsonify(error='No se pudo guardar el trabajo: ' + str(exc)), 500)
+    return jsonify(saved=True, work_code=project['work_code'], version=project.get('db_version'))
+
+@app.route('/api/work/update', methods=['POST'])
+def update_work():
+    project = get_project()
+    if not project.get('work_code'):
+        return (jsonify(error='No hay un trabajo persistente abierto.'), 400)
+    data = request.json or {}
+    name = str(data.get('name') or project.get('work_name') or '').strip()
+    responsible = str(data.get('responsible') or project.get('responsible') or '').strip()
+    status = str(data.get('status') or project.get('work_status') or 'En curso').strip()
+    if not name or not responsible:
+        return (jsonify(error='Nombre y responsable son obligatorios.'), 400)
+    project['work_name'] = name
+    project['responsible'] = responsible
+    project['work_status'] = status
+    try:
+        persist_project(project, 'Datos del trabajo actualizados', {'name': name, 'responsible': responsible, 'status': status})
+    except WorkConflictError as exc:
+        return (jsonify(error=str(exc), conflict=True), 409)
+    except Exception as exc:
+        return (jsonify(error=str(exc)), 500)
+    return jsonify(updated=True, state=project_state_payload(project))
+
+@app.route('/api/work/close', methods=['POST'])
+def close_work():
+    current = get_project()
+    if current.get('work_code'):
+        try:
+            persist_project(current, 'Trabajo cerrado en sesión')
+        except WorkConflictError:
+            pass
+        except Exception as exc:
+            print('No se pudo autoguardar al cerrar:', exc)
+    old_pid = session.pop('project_id', None)
+    session.pop('work_code', None)
+    if old_pid:
+        projects.pop(old_pid, None)
+    project = get_project()
+    return jsonify(closed=True, state=project_state_payload(project))
+
+@app.route('/api/work/events', methods=['GET'])
+def work_events():
+    project = get_project()
+    work_code = project.get('work_code')
+    if not work_code:
+        return jsonify(events=[])
+    try:
+        with db_connect() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('\n                    SELECT\n                        event_type,\n                        actor,\n                        details,\n                        created_at\n                    FROM audit_project_events\n                    WHERE work_code = %s\n                    ORDER BY created_at DESC\n                    LIMIT 100\n                    ', (work_code,))
+                rows = cur.fetchall()
+        events = [{'event_type': row['event_type'], 'actor': row['actor'], 'details': row['details'] or {}, 'created_at': row['created_at'].isoformat() if row['created_at'] else ''} for row in rows]
+        return jsonify(events=events)
+    except Exception as exc:
+        return (jsonify(error=str(exc)), 500)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return jsonify(
+            error='Seleccione un archivo'
+        ), 400
+
+    f = request.files['file']
+
+    if not f.filename or not allowed_file(f.filename):
+        return jsonify(
+            error=(
+                'Formato no admitido. '
+                'Use CSV, XLSX, XLS o XLSB.'
+            )
+        ), 400
+
+    name = f.filename
+    ext = name.rsplit('.', 1)[1].lower()
+
+    project = get_project()
+
+    old_path = project.get('source_path')
+
+    if (
+        old_path
+        and os.path.exists(old_path)
+        and os.path.dirname(old_path) == UPLOAD_FOLDER
+    ):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    path = os.path.join(
+        UPLOAD_FOLDER,
+        f'{uuid.uuid4()}_{name}'
     )
-    .format(
-        number
-    );
-}
+
+    try:
+        f.save(path)
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo guardar el archivo: ' + str(exc)
+        ), 500
+
+    try:
+        file_hash = compute_file_hash(path)
+
+        if ext == 'csv':
+            (
+                preview_df,
+                row_count,
+                encoding,
+                separator
+            ) = read_csv_metadata(path)
+
+            columns = list(
+                preview_df.columns
+            )
+
+            preview = (
+                preview_df
+                .fillna('')
+                .to_dict(orient='records')
+            )
+
+            # No se carga el millón de filas completo en RAM.
+            project['df'] = None
+            project['analysis_df'] = None
+            project['source_streaming'] = True
+            project['source_encoding'] = encoding
+            project['source_separator'] = separator
+
+        else:
+            file_size = os.path.getsize(path)
+
+            # Excel grande consume muchísima RAM con openpyxl.
+            # En ese caso se devuelve un error claro en vez de un 502.
+            if file_size > 75 * 1024 * 1024:
+                raise ValueError(
+                    'El Excel es demasiado grande para procesarlo '
+                    'de forma segura en este servidor. '
+                    'Guardalo como CSV y volvé a cargarlo.'
+                )
+
+            df = pd.read_excel(
+                path,
+                engine=(
+                    'pyxlsb'
+                    if ext == 'xlsb'
+                    else None
+                )
+            )
+
+            df.columns = [
+                str(column).strip()
+                for column in df.columns
+            ]
+
+            project['df'] = df
+            project['analysis_df'] = None
+            project['source_streaming'] = False
+            project['source_encoding'] = ''
+            project['source_separator'] = ''
+
+            row_count = int(len(df))
+            columns = list(df.columns)
+
+            preview = (
+                df.head(10)
+                .fillna('')
+                .to_dict(orient='records')
+            )
+
+    except Exception as exc:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+        return jsonify(
+            error='No se pudo leer el archivo: ' + str(exc)
+        ), 400
+
+    project['mapping'] = {}
+    project['sample'] = pd.DataFrame()
+    project['params'] = {}
+    project['audit_results'] = {}
+    project['analysis_cache'] = {}
+    project['source_name'] = name
+    project['source_hash'] = file_hash
+    project['source_path'] = path
+    project['source_ext'] = ext
+    project['source_rows'] = int(row_count)
+    project['source_columns'] = columns
+    project['source_preview'] = preview
+
+    if project.get('work_code'):
+        try:
+            persist_project(
+                project,
+                'Población cargada',
+                {
+                    'source_name': name,
+                    'rows': int(row_count)
+                },
+                save_population=True,
+                save_sample=True
+            )
+
+        except WorkConflictError as exc:
+            return jsonify(
+                error=str(exc),
+                conflict=True
+            ), 409
+
+        except Exception as exc:
+            return jsonify(
+                error=(
+                    'La población se cargó, pero no pudo guardarse '
+                    'en el trabajo persistente: '
+                    + str(exc)
+                )
+            ), 500
+
+    return jsonify(
+        rows=int(row_count),
+        columns=columns,
+        preview=preview
+    )
 
 
-// =========================================================
-// INICIAR TRACKING
-// =========================================================
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    project = get_project()
+    data = request.json or {}
 
-initializeWorkTracking();
+    id_col = (
+        data.get("id")
+        or data.get("id_col")
+    )
+
+    amount_col = (
+        data.get("amount")
+        or data.get("amount_col")
+    )
+
+    if not id_col or not amount_col:
+        return jsonify(
+            error="Debe definir las columnas ID e Importe"
+        ), 400
+
+    try:
+        universe = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
+
+        project["mapping"] = {
+            "id_col": id_col,
+            "amount_col": amount_col
+        }
+
+        analysis = population_analysis(
+            universe,
+            amount_col,
+            id_col=id_col,
+            source_rows=project.get(
+                "analysis_raw_rows",
+                len(universe)
+            ),
+            missing_id_rows=project.get(
+                "analysis_missing_ids",
+                0
+            )
+        )
+
+        project["analysis_cache"] = analysis
+        project["source_rows"] = int(
+            len(universe)
+        )
+
+        if project.get("work_code"):
+            persist_project(
+                project,
+                "Mapeo de población actualizado",
+                {
+                    "id_col": id_col,
+                    "amount_col": amount_col,
+                    "unique_ids": int(len(universe)),
+                    "source_rows_raw": int(
+                        analysis.get(
+                            "source_rows_raw",
+                            len(universe)
+                        )
+                    )
+                }
+            )
+
+        return jsonify(analysis)
+
+    except WorkConflictError as exc:
+        return jsonify(
+            error=str(exc),
+            conflict=True
+        ), 409
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error=(
+                "No se pudo analizar la población: "
+                + str(exc)
+            )
+        ), 500
+
+@app.route('/api/calculate-sample', methods=['POST'])
+def calculate_sample():
+    d = request.json or {}
+    N = int(d.get('N', 0))
+    confidence = d.get('confidence', '95')
+    error = float(d.get('error', 0.05))
+    p = float(d.get('p', 0.5))
+    n, z, q = sample_size(N, confidence, error, p)
+    return jsonify(n=n, z=z, q=q, formula='n=(Z²*p*q*N) / [e²*(N-1)+Z²*p*q]', variables={'N': N, 'Z': z, 'p': p, 'q': q, 'e': error})
+
+
+@app.route('/api/recommend', methods=['POST'])
+def recommend():
+    project = get_project()
+    data = request.json or {}
+
+    amount_col = data.get('amount_col')
+    id_col = (
+        project.get('mapping', {})
+        .get('id_col')
+    )
+
+    if not amount_col:
+        return jsonify(
+            error='Defina una columna de importe'
+        ), 400
+
+    try:
+        df = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
+
+        analysis = (
+            project.get('analysis_cache')
+            or population_analysis(
+                df,
+                amount_col
+            )
+        )
+
+        reasons = []
+
+        if analysis.get('top20_pct', 0) >= 40:
+            reasons.append(
+                'Existe alta concentración monetaria: '
+                'los 20 mayores importes explican al menos '
+                '40% del valor absoluto de la población.'
+            )
+
+        if analysis.get('outliers', 0) > 0:
+            reasons.append(
+                f"Se detectaron {analysis['outliers']} "
+                'valores atípicos por criterio de 3×IQR.'
+            )
+
+        threshold = float(
+            data.get('significant_threshold') or 0
+        )
+
+        significant = 0
+
+        if threshold > 0:
+            significant = int(
+                (
+                    parse_amount(
+                        df[amount_col]
+                    )
+                    .abs()
+                    >= threshold
+                ).sum()
+            )
+
+        if significant:
+            reasons.append(
+                f'Hay {significant} partidas iguales o '
+                'superiores al umbral significativo.'
+            )
+
+        if (
+            significant
+            or analysis.get('top20_pct', 0) >= 40
+        ):
+            method = 'stratified'
+            recommendation = (
+                'Revisión 100% de partidas significativas '
+                '+ muestreo estratificado del universo residual'
+            )
+
+        elif (
+            analysis.get('std', 0)
+            > abs(analysis.get('mean', 0))
+            and analysis.get('records', 0) > 30
+        ):
+            method = 'stratified'
+            recommendation = 'Muestreo estratificado'
+
+        else:
+            method = 'random'
+            recommendation = 'Muestreo aleatorio simple'
+
+        return jsonify(
+            method=method,
+            recommendation=recommendation,
+            reasons=(
+                reasons
+                or [
+                    'La población no presenta señales fuertes '
+                    'de concentración; un muestreo aleatorio '
+                    'simple es una alternativa razonable.'
+                ]
+            ),
+            analysis=analysis
+        )
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo generar la recomendación: ' + str(exc)
+        ), 500
+
+
+@app.route('/api/generate-sample', methods=['POST'])
+def generate_sample():
+    project = get_project()
+    data = request.json or {}
+
+    id_col = data.get('id_col')
+    amount_col = data.get('amount_col')
+
+    try:
+        df = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
+
+        previous_params = (
+            project.get('params', {})
+            .copy()
+        )
+
+        previous_signature = (
+            selection_signature(
+                previous_params,
+                previous_params.get('seed')
+            )
+            if previous_params
+            else None
+        )
+
+        selected, seed = make_sample(
+            df,
+            data
+        )
+
+        sample = hydrate_streaming_sample(
+            project,
+            selected
+        )
+
+        new_signature = selection_signature(
+            data,
+            seed
+        )
+
+        project['sample'] = sample
+        project['params'] = data.copy()
+        project['params']['seed'] = seed
+
+        if previous_signature != new_signature:
+            project['audit_results'] = {}
+
+        total = (
+            float(
+                parse_amount(
+                    df[amount_col]
+                )
+                .fillna(0)
+                .abs()
+                .sum()
+            )
+            if amount_col in df.columns
+            else 0
+        )
+
+        selected_amount = (
+            float(
+                sample
+                .get(
+                    '_amount_numeric',
+                    pd.Series(dtype=float)
+                )
+                .abs()
+                .sum()
+            )
+            if len(sample)
+            else 0
+        )
+
+        if project.get('work_code'):
+            persist_project(
+                project,
+                'Muestra generada',
+                {
+                    'selection_code': str(seed),
+                    'method': data.get('method', ''),
+                    'sample_rows': int(len(sample))
+                },
+                save_sample=True
+            )
+
+        return jsonify(
+            rows=int(len(sample)),
+            seed=seed,
+            selection_code=str(seed),
+            coverage_amount=(
+                selected_amount / total * 100
+                if total
+                else 0
+            ),
+            coverage_count=(
+                len(sample) / len(df) * 100
+                if len(df)
+                else 0
+            ),
+            method=data.get('method', ''),
+            preview=(
+                sample
+                .drop(
+                    columns=['_amount_numeric'],
+                    errors='ignore'
+                )
+                .head(500)
+                .fillna('')
+                .to_dict(orient='records')
+            )
+        )
+
+    except WorkConflictError as exc:
+        return jsonify(
+            error=str(exc),
+            conflict=True
+        ), 409
+
+    except ValueError as exc:
+        return jsonify(
+            error=str(exc)
+        ), 400
+
+    except Exception as exc:
+        return jsonify(
+            error='No se pudo generar la muestra: ' + str(exc)
+        ), 500
+
+@app.route('/api/sample', methods=['GET'])
+def sample_data():
+    p = get_project()
+    s = p.get('sample', pd.DataFrame())
+    return jsonify(rows=int(len(s)), data=s.drop(columns=['_amount_numeric'], errors='ignore').fillna('').to_dict(orient='records'))
+
+@app.route('/api/results', methods=['POST'])
+def save_results():
+    p = get_project()
+    data = request.json or {}
+    incoming = data.get('results', [])
+    clean = {}
+    for item in incoming:
+        normalized = normalize_result(item)
+        if normalized is not None:
+            clean[str(normalized['_original_index'])] = normalized
+    p['audit_results'] = clean
+    if p.get('work_code'):
+        try:
+            persist_project(p, 'Resultados guardados', {'results_count': len(clean)})
+        except WorkConflictError as exc:
+            return (jsonify(error=str(exc), conflict=True), 409)
+        except Exception as exc:
+            return (jsonify(error='Los resultados se procesaron, pero no pudieron guardarse en PostgreSQL: ' + str(exc)), 500)
+    return jsonify(saved=len(clean))
+
+@app.route('/api/review-template', methods=['GET'])
+def review_template():
+    p = get_project()
+    sample = p.get('sample', pd.DataFrame())
+    if sample.empty:
+        return (jsonify(error='Genere primero una muestra'), 400)
+    review_df = sample.drop(columns=['_amount_numeric'], errors='ignore').copy()
+    results = p.get('audit_results', {})
+    amount_col = p.get('params', {}).get('amount_col')
+    review_df['Resultado de revisión'] = [results.get(str(int(i)), {}).get('status', '') for i in review_df['_original_index']]
+    review_df['Importe registrado'] = [results.get(str(int(i)), {}).get('registered', review_df.loc[review_df['_original_index'] == i, amount_col].iloc[0] if amount_col in review_df.columns else '') for i in review_df['_original_index']]
+    review_df['Importe validado'] = [results.get(str(int(i)), {}).get('validated', '') for i in review_df['_original_index']]
+    review_df['Diferencia'] = [results.get(str(int(i)), {}).get('difference', '') for i in review_df['_original_index']]
+    review_df['Tipo de excepción'] = [results.get(str(int(i)), {}).get('exception_type', '') for i in review_df['_original_index']]
+    review_df['Comentario del auditor'] = [results.get(str(int(i)), {}).get('comment', '') for i in review_df['_original_index']]
+    review_df['Referencia de evidencia'] = [results.get(str(int(i)), {}).get('evidence', '') for i in review_df['_original_index']]
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+        review_df.to_excel(writer, sheet_name='Hoja_de_Revision', index=False)
+        wb = writer.book
+        ws = writer.sheets['Hoja_de_Revision']
+        header_fmt = wb.add_format({'bold': True, 'bg_color': '#222222', 'font_color': '#FFFFFF', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+        source_fmt = wb.add_format({'bg_color': '#F3F3F3', 'border': 1})
+        audit_fmt = wb.add_format({'bg_color': '#FFF7D1', 'border': 1})
+        audit_cols = {'Resultado de revisión', 'Importe registrado', 'Importe validado', 'Diferencia', 'Tipo de excepción', 'Comentario del auditor', 'Referencia de evidencia'}
+        for c, col in enumerate(review_df.columns):
+            ws.write(0, c, col, header_fmt)
+            width = 34 if col in {'Comentario del auditor', 'Referencia de evidencia'} else min(max(14, len(str(col)) + 3), 30)
+            ws.set_column(c, c, width, audit_fmt if col in audit_cols else source_fmt)
+        status_col = review_df.columns.get_loc('Resultado de revisión')
+        ws.data_validation(1, status_col, max(1, len(review_df)), status_col, {'validate': 'list', 'source': ['Pendiente', 'Sin excepción', 'Excepción monetaria', 'Excepción no monetaria']})
+        exception_col = review_df.columns.get_loc('Tipo de excepción')
+        ws.data_validation(1, exception_col, max(1, len(review_df)), exception_col, {'validate': 'list', 'source': ['Monetaria', 'Documental', 'Cumplimiento', 'Duplicado', 'Imputación / registración', 'Otro']})
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, len(review_df), len(review_df.columns) - 1)
+        guide = pd.DataFrame({'Campo': ['Resultado de revisión', 'Importe registrado', 'Importe validado', 'Diferencia', 'Tipo de excepción', 'Comentario del auditor', 'Referencia de evidencia'], 'Cómo completarlo': ['Indicá si el registro fue validado sin diferencias o presenta una excepción.', 'Valor informado originalmente en la población.', 'Valor determinado como correcto según la evidencia revisada.', 'Importe registrado menos Importe validado. La app lo recalcula al importar.', 'Clasificación breve del desvío detectado.', 'Descripción corta del hallazgo, diferencia o validación.', 'Factura, OC, ticket, SAP, archivo u otra evidencia utilizada.']})
+        guide.to_excel(writer, sheet_name='Guia', index=False)
+        writer.sheets['Guia'].set_column(0, 0, 30)
+        writer.sheets['Guia'].set_column(1, 1, 90)
+        params = p.get('params', {})
+        trace = pd.DataFrame([['Código de trabajo', p.get('work_code', '')], ['Nombre del trabajo', p.get('work_name', '')], ['Responsable', p.get('responsible', '')], ['Código de selección', params.get('seed', '')], ['Método', params.get('method', '')], ['Archivo origen', p.get('source_name', '')], ['Hash archivo origen', p.get('source_hash', '')]], columns=['Dato', 'Valor'])
+        trace.to_excel(writer, sheet_name='Trazabilidad', index=False)
+        writer.sheets['Trazabilidad'].set_column(0, 0, 28)
+        writer.sheets['Trazabilidad'].set_column(1, 1, 70)
+    out.seek(0)
+    return send_file(out, as_attachment=True, download_name='Hoja_Revision_Auditoria.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+@app.route('/api/import-results', methods=['POST'])
+def import_results():
+    p = get_project()
+    sample = p.get('sample', pd.DataFrame())
+    if sample.empty:
+        return (jsonify(error='Genere primero una muestra'), 400)
+    if 'file' not in request.files:
+        return (jsonify(error='Seleccione el Excel de revisión'), 400)
+    f = request.files['file']
+    try:
+        excel = pd.ExcelFile(f)
+        review_df = pd.read_excel(excel, sheet_name='Hoja_de_Revision')
+        trace_data = {}
+        if 'Trazabilidad' in excel.sheet_names:
+            trace_df = pd.read_excel(excel, sheet_name='Trazabilidad')
+            if 'Dato' in trace_df.columns and 'Valor' in trace_df.columns:
+                trace_data = {str(row['Dato']): row['Valor'] for _, row in trace_df.iterrows()}
+    except Exception as e:
+        return (jsonify(error='No se pudo leer el Excel de revisión: ' + str(e)), 400)
+    required = ['_original_index', 'Resultado de revisión', 'Importe registrado', 'Importe validado', 'Diferencia', 'Tipo de excepción', 'Comentario del auditor', 'Referencia de evidencia']
+    missing = [col for col in required if col not in review_df.columns]
+    if missing:
+        return (jsonify(error='Faltan columnas requeridas: ' + ', '.join(missing)), 400)
+
+    def normalize_seed(value):
+        if value in ('', None) or pd.isna(value):
+            return ''
+        try:
+            return str(int(float(value)))
+        except Exception:
+            return str(value).strip()
+    current_work_code = str(p.get('work_code', '') or '').strip().upper()
+    imported_work_code = str(trace_data.get('Código de trabajo', '') or '').strip().upper()
+    if imported_work_code and current_work_code and (imported_work_code != current_work_code):
+        return (jsonify(error='El Excel corresponde a otro Código de trabajo. No se importaron resultados.'), 400)
+    current_seed = normalize_seed(p.get('params', {}).get('seed', ''))
+    imported_seed = normalize_seed(trace_data.get('Código de selección', ''))
+    if imported_seed and current_seed and (imported_seed != current_seed):
+        return (jsonify(error='El Excel corresponde a otro Código de selección. Importe la hoja asociada a la muestra actual.'), 400)
+    current_hash = str(p.get('source_hash', ''))
+    imported_hash = str(trace_data.get('Hash archivo origen', ''))
+    if imported_hash and current_hash and (imported_hash != current_hash):
+        return (jsonify(error='El Excel corresponde a otra población. No se importaron resultados.'), 400)
+    sample_ids = set(sample['_original_index'].astype(int).tolist())
+    incoming_ids = pd.to_numeric(review_df['_original_index'], errors='coerce')
+    if incoming_ids.isna().any():
+        return (jsonify(error='Hay identificadores internos inválidos en el Excel.'), 400)
+    incoming_ids = incoming_ids.astype(int)
+    duplicates = incoming_ids[incoming_ids.duplicated()].tolist()
+    if duplicates:
+        return (jsonify(error='El Excel contiene IDs internos duplicados: ' + ', '.join((str(x) for x in duplicates[:10]))), 400)
+    foreign = sorted(set(incoming_ids.tolist()) - sample_ids)
+    if foreign:
+        return (jsonify(error='El Excel contiene registros que no pertenecen a la muestra actual: ' + ', '.join((str(x) for x in foreign[:10]))), 400)
+    imported = {}
+    for _, row in review_df.iterrows():
+        idx = int(row['_original_index'])
+        reg_raw = pd.to_numeric(pd.Series([row['Importe registrado']]), errors='coerce').iloc[0]
+        val_raw = pd.to_numeric(pd.Series([row['Importe validado']]), errors='coerce').iloc[0]
+        registered = '' if pd.isna(reg_raw) else float(reg_raw)
+        validated = '' if pd.isna(val_raw) else float(val_raw)
+        if registered != '' and validated != '':
+            difference = registered - validated
+        else:
+            diff_raw = pd.to_numeric(pd.Series([row['Diferencia']]), errors='coerce').iloc[0]
+            difference = 0.0 if pd.isna(diff_raw) else float(diff_raw)
+
+        def text_value(col):
+            value = row[col]
+            return '' if pd.isna(value) else str(value).strip()
+        imported[str(idx)] = {'_original_index': idx, 'status': text_value('Resultado de revisión'), 'registered': registered, 'validated': validated, 'difference': float(difference), 'exception_type': text_value('Tipo de excepción'), 'comment': text_value('Comentario del auditor'), 'evidence': text_value('Referencia de evidencia')}
+    p['audit_results'].update(imported)
+    if p.get('work_code'):
+        try:
+            persist_project(p, 'Resultados importados desde Excel', {'imported': len(imported)})
+        except WorkConflictError as exc:
+            return (jsonify(error=str(exc), conflict=True), 409)
+        except Exception as exc:
+            return (jsonify(error='Los resultados se importaron, pero no pudieron guardarse en PostgreSQL: ' + str(exc)), 500)
+    return jsonify(imported=len(imported), missing_from_file=len(sample_ids - set(incoming_ids.tolist())), results=list(imported.values()))
+
+@app.route('/api/extrapolation', methods=['GET'])
+def extrapolation():
+    p = get_project()
+    try:
+        return jsonify(calculate_extrapolation(p))
+    except ValueError as e:
+        return (jsonify(error=str(e)), 400)
+
+
+@app.route('/api/export', methods=['GET'])
+def export_excel():
+    project = get_project()
+    sample = project.get('sample', pd.DataFrame())
+
+    has_population = (
+        project.get('df') is not None
+        or project.get('source_streaming')
+    )
+
+    if not has_population:
+        return jsonify(
+            error='Sin población'
+        ), 400
+
+    out = BytesIO()
+
+    with pd.ExcelWriter(
+        out,
+        engine='xlsxwriter'
+    ) as writer:
+
+        if project.get('source_streaming'):
+            source_info = pd.DataFrame([
+                {
+                    'Archivo origen': project.get('source_name', ''),
+                    'Filas': int(project.get('source_rows') or 0),
+                    'Columnas': len(project.get('source_columns') or []),
+                    'Hash SHA-256': project.get('source_hash', ''),
+                    'Nota': (
+                        'La población original no se incrusta en este Excel '
+                        'por su tamaño. Se conserva la trazabilidad mediante '
+                        'nombre de archivo y hash SHA-256.'
+                    )
+                }
+            ])
+
+            source_info.to_excel(
+                writer,
+                sheet_name='01_Poblacion_Original',
+                index=False
+            )
+
+            analysis = (
+                project.get('analysis_cache')
+                or {}
+            )
+
+        else:
+            df = project.get('df')
+
+            df.to_excel(
+                writer,
+                sheet_name='01_Poblacion_Original',
+                index=False
+            )
+
+            analysis = (
+                project.get('analysis_cache')
+                or population_analysis(
+                    df,
+                    project
+                    .get('mapping', {})
+                    .get('amount_col')
+                )
+            )
+
+        analysis_rows = []
+
+        for key, value in analysis.items():
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    analysis_rows.append(
+                        [f'{key}.{subkey}', subvalue]
+                    )
+
+            elif isinstance(value, list):
+                analysis_rows.append(
+                    [
+                        key,
+                        ', '.join(
+                            str(item)
+                            for item in value
+                        )
+                    ]
+                )
+
+            else:
+                analysis_rows.append(
+                    [key, value]
+                )
+
+        pd.DataFrame(
+            analysis_rows,
+            columns=['Métrica', 'Valor']
+        ).to_excel(
+            writer,
+            sheet_name='02_Analisis_Poblacion',
+            index=False
+        )
+
+        params_rows = [
+            [
+                'Código de selección'
+                if key == 'seed'
+                else key,
+                value
+            ]
+            for key, value
+            in project.get('params', {}).items()
+        ]
+
+        pd.DataFrame(
+            params_rows,
+            columns=['Parámetro', 'Valor']
+        ).to_excel(
+            writer,
+            sheet_name='03_Parametros_Muestreo',
+            index=False
+        )
+
+        sample.drop(
+            columns=['_amount_numeric'],
+            errors='ignore'
+        ).to_excel(
+            writer,
+            sheet_name='04_Muestra_Seleccionada',
+            index=False
+        )
+
+        pd.DataFrame(
+            get_audit_rows(project)
+        ).to_excel(
+            writer,
+            sheet_name='05_Resultados_Auditoria',
+            index=False
+        )
+
+        try:
+            extra = calculate_extrapolation(
+                project
+            )
+
+            extra_rows = []
+
+            for key, value in extra.items():
+                if isinstance(value, dict):
+                    for subkey, subvalue in value.items():
+                        extra_rows.append(
+                            [
+                                f'{key}.{subkey}',
+                                subvalue
+                            ]
+                        )
+
+                else:
+                    extra_rows.append(
+                        [key, value]
+                    )
+
+            pd.DataFrame(
+                extra_rows,
+                columns=['Métrica', 'Valor']
+            ).to_excel(
+                writer,
+                sheet_name='06_Extrapolacion',
+                index=False
+            )
+
+        except Exception:
+            pd.DataFrame([
+                {
+                    'Estado':
+                        'Pendiente de resultados'
+                }
+            ]).to_excel(
+                writer,
+                sheet_name='06_Extrapolacion',
+                index=False
+            )
+
+        summary = pd.DataFrame([
+            {
+                'Código de trabajo': project.get('work_code', ''),
+                'Nombre del trabajo': project.get('work_name', ''),
+                'Responsable': project.get('responsible', ''),
+                'Proyecto': project.get('source_name', ''),
+                'Fecha': datetime.now().isoformat(),
+                'Población': int(
+                    project.get('source_rows')
+                    or (
+                        len(project.get('df'))
+                        if project.get('df') is not None
+                        else 0
+                    )
+                ),
+                'Muestra': len(sample),
+                'Código de selección': (
+                    project
+                    .get('params', {})
+                    .get('seed', '')
+                ),
+                'Hash archivo original': project.get('source_hash', '')
+            }
+        ])
+
+        summary.to_excel(
+            writer,
+            sheet_name='07_Resumen_Ejecutivo',
+            index=False
+        )
+
+        for worksheet in writer.sheets.values():
+            worksheet.freeze_panes(1, 0)
+
+            max_col = min(
+                30,
+                max(
+                    0,
+                    worksheet.dim_colmax
+                )
+            )
+
+            worksheet.set_column(
+                0,
+                max_col,
+                18
+            )
+
+    out.seek(0)
+
+    return send_file(
+        out,
+        as_attachment=True,
+        download_name='Audit_Sampling_Export.xlsx',
+        mimetype=(
+            'application/vnd.openxmlformats-officedocument.'
+            'spreadsheetml.sheet'
+        )
+    )
+
