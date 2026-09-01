@@ -1390,24 +1390,45 @@ def add_selection(base, idx, reason, method, selection_type, stratum):
 
 
 def make_sample(df, params):
+    """
+    Genera una muestra cuyo tamaño FINAL nunca supera n.
+
+    Si se activan partidas significativas u outliers, esos registros
+    se priorizan DENTRO del tamaño n. Nunca se agregan por fuera de n.
+    """
     id_col = params.get('id_col')
     amount_col = params.get('amount_col')
     method = params.get('method', 'random')
+
     seed = int(
         params.get('seed')
         or np.random.randint(1, 2 ** 31 - 1)
     )
 
     rng = np.random.default_rng(seed)
-    n = int(params.get('n', 0) or 0)
+
+    requested_n = int(
+        params.get('n', 0) or 0
+    )
 
     if df is None or df.empty:
         return pd.DataFrame(), seed
 
+    target_n = min(
+        requested_n,
+        len(df)
+    )
+
+    if target_n <= 0:
+        return pd.DataFrame(), seed
+
     if amount_col and amount_col in df.columns:
-        amount = parse_amount(
-            df[amount_col]
-        ).fillna(0)
+        amount = (
+            parse_amount(
+                df[amount_col]
+            )
+            .fillna(0)
+        )
     else:
         amount = pd.Series(
             0.0,
@@ -1415,17 +1436,26 @@ def make_sample(df, params):
         )
 
     selected = []
+
     excluded = np.zeros(
         len(df),
         dtype=bool
     )
+
+    def available_slots():
+        return max(
+            target_n
+            - int(excluded.sum()),
+            0
+        )
 
     def append_selection(
         indices,
         reason,
         method_name,
         selection_type,
-        stratum
+        stratum,
+        max_rows=None
     ):
         indices = np.asarray(
             list(indices),
@@ -1433,7 +1463,33 @@ def make_sample(df, params):
         )
 
         if len(indices) == 0:
-            return
+            return 0
+
+        # Nunca vuelve a elegir registros ya seleccionados.
+        indices = indices[
+            ~excluded[indices]
+        ]
+
+        if len(indices) == 0:
+            return 0
+
+        slots = available_slots()
+
+        if slots <= 0:
+            return 0
+
+        limit = slots
+
+        if max_rows is not None:
+            limit = min(
+                limit,
+                int(max_rows)
+            )
+
+        indices = indices[:limit]
+
+        if len(indices) == 0:
+            return 0
 
         selected.append(
             (
@@ -1447,27 +1503,54 @@ def make_sample(df, params):
 
         excluded[indices] = True
 
+        return len(indices)
+
+    # ---------------------------------------------------------
+    # 1. PARTIDAS SIGNIFICATIVAS
+    # Se priorizan dentro de n. No aumentan el tamaño final.
+    # ---------------------------------------------------------
+
     threshold = float(
-        params.get('significant_threshold') or 0
+        params.get('significant_threshold')
+        or 0
     )
 
     if (
         params.get('include_materiality')
         and threshold > 0
+        and available_slots() > 0
     ):
-        idx = amount.index[
-            amount.abs() >= threshold
-        ].to_numpy(dtype=np.int64)
-
-        append_selection(
-            idx,
-            'Partida significativa',
-            'Revisión 100%',
-            'Dirigida_100',
-            '100%'
+        significant_idx = (
+            amount[
+                amount.abs() >= threshold
+            ]
+            .abs()
+            .sort_values(
+                ascending=False
+            )
+            .index
+            .to_numpy(
+                dtype=np.int64
+            )
         )
 
-    if params.get('include_outliers'):
+        append_selection(
+            significant_idx,
+            'Partida significativa priorizada',
+            'Selección dirigida',
+            'Dirigida',
+            'Significativa'
+        )
+
+    # ---------------------------------------------------------
+    # 2. OUTLIERS
+    # También se priorizan dentro de n.
+    # ---------------------------------------------------------
+
+    if (
+        params.get('include_outliers')
+        and available_slots() > 0
+    ):
         available_idx = np.flatnonzero(
             ~excluded
         )
@@ -1479,36 +1562,56 @@ def make_sample(df, params):
 
             q1 = x.quantile(0.25)
             q3 = x.quantile(0.75)
+
             iqr = q3 - q1
 
             lower = q1 - 3 * iqr
             upper = q3 + 3 * iqr
 
-            idx = x.index[
-                (x < lower) | (x > upper)
-            ].to_numpy(dtype=np.int64)
+            outlier_series = x[
+                (x < lower)
+                | (x > upper)
+            ]
+
+            # Prioriza los outliers de mayor magnitud.
+            outlier_idx = (
+                outlier_series
+                .abs()
+                .sort_values(
+                    ascending=False
+                )
+                .index
+                .to_numpy(
+                    dtype=np.int64
+                )
+            )
 
             append_selection(
-                idx,
-                'Valor atípico',
-                'Revisión 100%',
-                'Dirigida_100',
-                '100%'
+                outlier_idx,
+                'Outlier priorizado',
+                'Selección dirigida',
+                'Dirigida',
+                'Outlier'
             )
+
+    # ---------------------------------------------------------
+    # 3. COMPLETA EL RESTO HASTA n
+    # ---------------------------------------------------------
 
     residual_idx = np.flatnonzero(
         ~excluded
     )
 
-    n = min(
-        n,
+    remaining_n = min(
+        available_slots(),
         len(residual_idx)
     )
 
-    if n > 0 and method == 'random':
+    if remaining_n > 0 and method == 'random':
+
         idx = rng.choice(
             residual_idx,
-            size=n,
+            size=remaining_n,
             replace=False
         )
 
@@ -1520,22 +1623,40 @@ def make_sample(df, params):
             'Probabilístico'
         )
 
-    elif n > 0 and method == 'systematic':
+    elif remaining_n > 0 and method == 'systematic':
+
         if id_col and id_col in df.columns:
             ordered_idx = (
-                df.iloc[residual_idx][id_col]
-                .sort_values(kind='mergesort')
+                df.iloc[
+                    residual_idx
+                ][id_col]
+                .sort_values(
+                    kind='mergesort'
+                )
                 .index
-                .to_numpy(dtype=np.int64)
+                .to_numpy(
+                    dtype=np.int64
+                )
             )
         else:
             ordered_idx = residual_idx
 
-        interval = len(ordered_idx) / n
-        start = rng.uniform(0, interval)
+        interval = (
+            len(ordered_idx)
+            / remaining_n
+        )
+
+        start = rng.uniform(
+            0,
+            interval
+        )
 
         positions = np.floor(
-            start + np.arange(n) * interval
+            start
+            + np.arange(
+                remaining_n
+            )
+            * interval
         ).astype(int)
 
         positions = np.clip(
@@ -1544,7 +1665,9 @@ def make_sample(df, params):
             len(ordered_idx) - 1
         )
 
-        idx = ordered_idx[positions]
+        idx = ordered_idx[
+            positions
+        ]
 
         append_selection(
             idx,
@@ -1554,10 +1677,12 @@ def make_sample(df, params):
             'Probabilístico'
         )
 
-    elif n > 0 and method == 'mus':
+    elif remaining_n > 0 and method == 'mus':
+
         positive_idx = residual_idx[
-            amount.iloc[residual_idx]
-            .to_numpy() > 0
+            amount.iloc[
+                residual_idx
+            ].to_numpy() > 0
         ]
 
         if len(positive_idx):
@@ -1570,7 +1695,11 @@ def make_sample(df, params):
             )
 
             if total_positive > 0:
-                interval = total_positive / n
+                interval = (
+                    total_positive
+                    / remaining_n
+                )
+
                 start = rng.uniform(
                     0,
                     interval
@@ -1578,7 +1707,10 @@ def make_sample(df, params):
 
                 points = (
                     start
-                    + np.arange(n) * interval
+                    + np.arange(
+                        remaining_n
+                    )
+                    * interval
                 )
 
                 cumulative = (
@@ -1600,7 +1732,9 @@ def make_sample(df, params):
                 )
 
                 idx = positive_idx[
-                    np.unique(locations)
+                    np.unique(
+                        locations
+                    )
                 ]
 
                 append_selection(
@@ -1611,13 +1745,20 @@ def make_sample(df, params):
                     'Probabilístico'
                 )
 
-    elif n > 0 and method == 'topn':
+    elif remaining_n > 0 and method == 'topn':
+
         idx = (
-            amount.iloc[residual_idx]
+            amount.iloc[
+                residual_idx
+            ]
             .abs()
-            .nlargest(n)
+            .nlargest(
+                remaining_n
+            )
             .index
-            .to_numpy(dtype=np.int64)
+            .to_numpy(
+                dtype=np.int64
+            )
         )
 
         append_selection(
@@ -1628,18 +1769,25 @@ def make_sample(df, params):
             'Dirigido'
         )
 
-    elif n > 0 and method == 'stratified':
+    elif remaining_n > 0 and method == 'stratified':
+
         values = amount.iloc[
             residual_idx
         ].abs()
 
-        q50 = values.quantile(0.50)
-        q90 = values.quantile(0.90)
+        q50 = values.quantile(
+            0.50
+        )
+
+        q90 = values.quantile(
+            0.90
+        )
 
         if q50 == q90:
+
             idx = rng.choice(
                 residual_idx,
-                size=n,
+                size=remaining_n,
                 replace=False
             )
 
@@ -1652,24 +1800,32 @@ def make_sample(df, params):
             )
 
         else:
+
             strata = [
                 values.index[
                     values <= q50
-                ].to_numpy(dtype=np.int64),
+                ].to_numpy(
+                    dtype=np.int64
+                ),
 
                 values.index[
                     (values > q50)
                     & (values <= q90)
-                ].to_numpy(dtype=np.int64),
+                ].to_numpy(
+                    dtype=np.int64
+                ),
 
                 values.index[
                     values > q90
-                ].to_numpy(dtype=np.int64)
+                ].to_numpy(
+                    dtype=np.int64
+                )
             ]
 
             picks = []
 
             for group in strata:
+
                 if len(group) == 0:
                     continue
 
@@ -1678,9 +1834,11 @@ def make_sample(df, params):
                     max(
                         1,
                         round(
-                            n
+                            remaining_n
                             * len(group)
-                            / len(residual_idx)
+                            / len(
+                                residual_idx
+                            )
                         )
                     )
                 )
@@ -1694,17 +1852,23 @@ def make_sample(df, params):
                 )
 
             picks = list(
-                dict.fromkeys(picks)
+                dict.fromkeys(
+                    picks
+                )
             )
 
-            if len(picks) > n:
+            if len(picks) > remaining_n:
                 picks = rng.choice(
-                    np.array(picks),
-                    size=n,
+                    np.array(
+                        picks,
+                        dtype=np.int64
+                    ),
+                    size=remaining_n,
                     replace=False
                 ).tolist()
 
-            if len(picks) < n:
+            if len(picks) < remaining_n:
+
                 remaining = np.setdiff1d(
                     residual_idx,
                     np.array(
@@ -1715,7 +1879,8 @@ def make_sample(df, params):
                 )
 
                 extra = min(
-                    n - len(picks),
+                    remaining_n
+                    - len(picks),
                     len(remaining)
                 )
 
@@ -1729,9 +1894,42 @@ def make_sample(df, params):
                     )
 
             append_selection(
-                picks[:n],
+                picks[:remaining_n],
                 'Selección estratificada',
                 'Estratificado',
+                'Probabilistica',
+                'Probabilístico'
+            )
+
+    # ---------------------------------------------------------
+    # 4. GARANTÍA FINAL
+    # Algunos métodos como MUS pueden devolver menos registros
+    # únicos que puntos monetarios. Completa aleatoriamente.
+    # ---------------------------------------------------------
+
+    if available_slots() > 0:
+
+        residual_idx = np.flatnonzero(
+            ~excluded
+        )
+
+        extra = min(
+            available_slots(),
+            len(residual_idx)
+        )
+
+        if extra > 0:
+
+            idx = rng.choice(
+                residual_idx,
+                size=extra,
+                replace=False
+            )
+
+            append_selection(
+                idx,
+                'Complemento hasta tamaño calculado',
+                'Aleatorio complementario',
                 'Probabilistica',
                 'Probabilístico'
             )
@@ -1748,6 +1946,7 @@ def make_sample(df, params):
         selection_type,
         stratum
     ) in selected:
+
         frame = add_selection(
             df,
             indices,
@@ -1758,11 +1957,15 @@ def make_sample(df, params):
         )
 
         frame['_amount_numeric'] = (
-            amount.loc[frame.index]
+            amount.loc[
+                frame.index
+            ]
             .to_numpy()
         )
 
-        frames.append(frame)
+        frames.append(
+            frame
+        )
 
     out = pd.concat(
         frames,
@@ -1770,11 +1973,20 @@ def make_sample(df, params):
     )
 
     out = out.drop_duplicates(
-        subset=['_original_index'],
+        subset=[
+            '_original_index'
+        ],
         keep='first'
     )
 
+    # Última barrera: jamás devolver más de n.
+    if len(out) > target_n:
+        out = out.iloc[
+            :target_n
+        ].copy()
+
     return out, seed
+
 
 def normalize_result(item):
     idx = item.get('_original_index')
