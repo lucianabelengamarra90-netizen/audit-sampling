@@ -183,6 +183,13 @@ def record_to_project(row):
     return {
         'df': blob_to_df(row['population_blob']) if row.get('population_blob') is not None else None,
         'analysis_df': None,
+        'analysis_mapping': None,
+        'analysis_raw_rows': int(
+            (row.get('analysis_cache') or {}).get('source_rows_raw', 0)
+        ),
+        'analysis_missing_ids': int(
+            (row.get('analysis_cache') or {}).get('missing_id_rows', 0)
+        ),
         'mapping': row['mapping'] or {},
         'sample': blob_to_df(row['sample_blob']) if row.get('sample_blob') is not None else pd.DataFrame(),
         'params': row['params'] or {},
@@ -430,6 +437,9 @@ def new_temp_project():
     return {
         'df': None,
         'analysis_df': None,
+        'analysis_mapping': None,
+        'analysis_raw_rows': 0,
+        'analysis_missing_ids': 0,
         'mapping': {},
         'sample': pd.DataFrame(),
         'params': {},
@@ -567,157 +577,438 @@ def read_csv_metadata(path):
     )
 
 
+def normalize_id_series(series):
+    """
+    Normaliza el ID elegido por el usuario.
+    Los IDs vacíos se excluyen porque no permiten identificar
+    de forma reproducible una unidad de muestreo.
+    """
+    normalized = (
+        series
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+
+    invalid = (
+        normalized.eq("")
+        | normalized.str.lower().isin(
+            {"nan", "none", "nat", "<na>"}
+        )
+    )
+
+    return normalized.mask(invalid)
+
+
 def analysis_dataframe(project, id_col=None, amount_col=None):
     """
-    Devuelve únicamente las columnas necesarias para el análisis.
-    Para CSV grandes evita cargar todas las columnas en memoria.
-    """
-    if not project.get('source_streaming'):
-        return project.get('df')
+    Construye el universo de muestreo a partir de la combinación
+    ID + Importe elegida por el usuario.
 
-    cached = project.get('analysis_df')
+    Una combinación ID + Importe repetida muchas veces en el archivo
+    se considera UN SOLO registro para el muestreo.
+
+    Se conserva además la primera fila física de origen para poder
+    recuperar correctamente todos los demás campos al generar la muestra.
+    """
+    id_col = str(id_col or "").strip()
+    amount_col = str(amount_col or "").strip()
+
+    if not id_col or not amount_col:
+        raise ValueError(
+            "Debe definir las columnas ID e Importe."
+        )
+
+    if id_col == amount_col:
+        raise ValueError(
+            "La columna ID y la columna Importe deben ser diferentes."
+        )
+
+    cached = project.get("analysis_df")
+    cached_mapping = project.get("analysis_mapping")
 
     if (
         cached is not None
+        and cached_mapping == (id_col, amount_col)
         and id_col in cached.columns
         and amount_col in cached.columns
     ):
         return cached
 
-    path = project.get('source_path')
+    representative_parts = []
+    count_parts = []
 
-    if not path or not os.path.exists(path):
-        raise ValueError(
-            'La población original ya no está disponible en el servidor. '
-            'Volvé a cargar el archivo fuente para continuar.'
+    source_rows_raw = 0
+    missing_id_rows = 0
+    offset = 0
+
+    def process_part(frame, base_offset):
+        nonlocal source_rows_raw, missing_id_rows
+
+        frame = frame.copy()
+
+        frame.columns = [
+            str(column).strip()
+            for column in frame.columns
+        ]
+
+        if id_col not in frame.columns:
+            raise ValueError(
+                "No se encuentra la columna ID seleccionada."
+            )
+
+        if amount_col not in frame.columns:
+            raise ValueError(
+                "No se encuentra la columna Importe seleccionada."
+            )
+
+        row_count = len(frame)
+        source_rows_raw += row_count
+
+        ids = normalize_id_series(
+            frame[id_col]
         )
 
-    wanted = {
-        str(id_col).strip(),
-        str(amount_col).strip()
-    }
-
-    df = pd.read_csv(
-        path,
-        sep=project.get('source_separator') or ';',
-        encoding=project.get('source_encoding') or 'utf-8',
-        usecols=lambda column: str(column).strip() in wanted,
-        low_memory=True
-    )
-
-    df.columns = [
-        str(column).strip()
-        for column in df.columns
-    ]
-
-    missing = [
-        column
-        for column in wanted
-        if column not in df.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            'No se encontraron las columnas seleccionadas: '
-            + ', '.join(sorted(missing))
+        amounts = parse_amount(
+            frame[amount_col]
         )
 
-    # Convierte el importe una sola vez y conserva una columna numérica
-    # mucho más liviana que los textos con formato regional.
-    df[amount_col] = parse_amount(
-        df[amount_col]
+        valid_id = ids.notna()
+        missing_id_rows += int((~valid_id).sum())
+
+        if not valid_id.any():
+            return
+
+        positions = (
+            base_offset
+            + np.arange(
+                row_count,
+                dtype=np.int64
+            )
+        )
+
+        work = pd.DataFrame(
+            {
+                id_col: ids.to_numpy(),
+                amount_col: amounts.to_numpy(),
+                "_source_index": positions
+            }
+        )
+
+        work = work.loc[
+            valid_id.to_numpy()
+        ].copy()
+
+        # Un representante por combinación ID + importe dentro del bloque.
+        representatives = (
+            work
+            .drop_duplicates(
+                subset=[id_col, amount_col],
+                keep="first"
+            )
+            [[id_col, amount_col, "_source_index"]]
+        )
+
+        representative_parts.append(
+            representatives
+        )
+
+        # Cantidad de filas físicas que originaron cada combinación.
+        counts = (
+            work
+            .groupby(
+                [id_col, amount_col],
+                sort=False,
+                dropna=False
+            )
+            .size()
+            .rename("_source_row_count")
+            .reset_index()
+        )
+
+        count_parts.append(
+            counts
+        )
+
+    if project.get("source_streaming"):
+        path = project.get("source_path")
+
+        if not path or not os.path.exists(path):
+            raise ValueError(
+                "La población original ya no está disponible en el servidor. "
+                "Volvé a cargar el archivo fuente para continuar."
+            )
+
+        wanted = {
+            id_col,
+            amount_col
+        }
+
+        reader = pd.read_csv(
+            path,
+            sep=project.get("source_separator") or ";",
+            encoding=project.get("source_encoding") or "utf-8",
+            usecols=lambda column:
+                str(column).strip() in wanted,
+            chunksize=100000,
+            low_memory=True
+        )
+
+        for chunk in reader:
+            process_part(
+                chunk,
+                offset
+            )
+
+            offset += len(chunk)
+
+    else:
+        source = project.get("df")
+
+        if source is None:
+            raise ValueError(
+                "Cargue primero una población."
+            )
+
+        process_part(
+            source[[id_col, amount_col]],
+            0
+        )
+
+    if not representative_parts:
+        raise ValueError(
+            "No se encontraron IDs válidos para construir la población."
+        )
+
+    # Quita también duplicados que hayan quedado repartidos
+    # entre distintos bloques del CSV.
+    representatives = (
+        pd.concat(
+            representative_parts,
+            ignore_index=True
+        )
+        .drop_duplicates(
+            subset=[id_col, amount_col],
+            keep="first"
+        )
+        .reset_index(drop=True)
     )
 
-    project['analysis_df'] = df
-    project['source_rows'] = int(len(df))
+    counts = (
+        pd.concat(
+            count_parts,
+            ignore_index=True
+        )
+        .groupby(
+            [id_col, amount_col],
+            sort=False,
+            dropna=False
+        )["_source_row_count"]
+        .sum()
+        .reset_index()
+    )
 
-    return df
+    universe = representatives.merge(
+        counts,
+        on=[id_col, amount_col],
+        how="left",
+        sort=False
+    )
 
+    universe[id_col] = (
+        universe[id_col]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+
+    universe[amount_col] = pd.to_numeric(
+        universe[amount_col],
+        errors="coerce"
+    )
+
+    universe["_source_index"] = (
+        universe["_source_index"]
+        .astype("int64")
+    )
+
+    universe["_source_row_count"] = (
+        universe["_source_row_count"]
+        .fillna(1)
+        .astype("int64")
+    )
+
+    universe = universe.reset_index(
+        drop=True
+    )
+
+    project["analysis_df"] = universe
+    project["analysis_mapping"] = (
+        id_col,
+        amount_col
+    )
+
+    project["analysis_raw_rows"] = int(
+        source_rows_raw
+    )
+
+    project["analysis_missing_ids"] = int(
+        missing_id_rows
+    )
+
+    project["source_rows"] = int(
+        len(universe)
+    )
+
+    return universe
 
 def hydrate_streaming_sample(project, selected):
     """
-    Recupera del CSV solo las filas seleccionadas y todas sus columnas.
-    Trabaja por bloques pequeños para mantener bajo el uso de RAM.
+    Recupera exactamente la fila física representativa de cada
+    registro único ID + Importe seleccionado.
+
+    La selección estadística se realiza sobre el universo deduplicado,
+    mientras que la salida conserva todos los campos originales.
     """
     if selected is None or selected.empty:
         return pd.DataFrame()
 
-    path = project.get('source_path')
-
-    if not path or not os.path.exists(path):
+    if "_source_index" not in selected.columns:
         raise ValueError(
-            'La población original ya no está disponible en el servidor. '
-            'Volvé a cargar el archivo fuente para generar la muestra.'
+            "La muestra no contiene la referencia a la fila de origen."
         )
 
-    selected_indices = (
-        selected['_original_index']
+    source_indices = (
+        selected["_source_index"]
         .astype(int)
         .to_numpy()
     )
 
-    selected_set = set(
-        selected_indices.tolist()
+    wanted_indices = set(
+        source_indices.tolist()
     )
 
-    pieces = []
-    offset = 0
+    source_pieces = []
 
-    reader = pd.read_csv(
-        path,
-        sep=project.get('source_separator') or ';',
-        encoding=project.get('source_encoding') or 'utf-8',
-        chunksize=25000,
-        low_memory=True
-    )
+    if project.get("source_streaming"):
+        path = project.get("source_path")
 
-    for chunk in reader:
-        chunk.columns = [
-            str(column).strip()
-            for column in chunk.columns
-        ]
+        if not path or not os.path.exists(path):
+            raise ValueError(
+                "La población original ya no está disponible en el servidor. "
+                "Volvé a cargar el archivo fuente para generar la muestra."
+            )
 
-        start = offset
-        stop = offset + len(chunk)
+        offset = 0
 
-        local_indices = [
+        reader = pd.read_csv(
+            path,
+            sep=project.get("source_separator") or ";",
+            encoding=project.get("source_encoding") or "utf-8",
+            chunksize=25000,
+            low_memory=True
+        )
+
+        remaining = set(
+            wanted_indices
+        )
+
+        for chunk in reader:
+            chunk.columns = [
+                str(column).strip()
+                for column in chunk.columns
+            ]
+
+            start = offset
+            stop = offset + len(chunk)
+
+            local_indices = [
+                index
+                for index in remaining
+                if start <= index < stop
+            ]
+
+            if local_indices:
+                positions = (
+                    np.array(
+                        local_indices,
+                        dtype=np.int64
+                    )
+                    - start
+                )
+
+                part = chunk.iloc[
+                    positions
+                ].copy()
+
+                part["_source_index"] = np.array(
+                    local_indices,
+                    dtype=np.int64
+                )
+
+                source_pieces.append(
+                    part
+                )
+
+                remaining.difference_update(
+                    local_indices
+                )
+
+                if not remaining:
+                    break
+
+            offset = stop
+
+    else:
+        source = project.get("df")
+
+        if source is None:
+            raise ValueError(
+                "La población original no está disponible."
+            )
+
+        valid_positions = [
             index
-            for index in selected_set
-            if start <= index < stop
+            for index in source_indices
+            if 0 <= index < len(source)
         ]
 
-        if local_indices:
-            positions = np.array(
-                local_indices,
-                dtype=np.int64
-            ) - start
+        if valid_positions:
+            part = source.iloc[
+                valid_positions
+            ].copy()
 
-            part = chunk.iloc[positions].copy()
-
-            part['_original_index'] = np.array(
-                local_indices,
+            part["_source_index"] = np.array(
+                valid_positions,
                 dtype=np.int64
             )
 
-            pieces.append(part)
+            source_pieces.append(
+                part
+            )
 
-        offset = stop
-
-    if not pieces:
-        return pd.DataFrame()
-
-    source_rows = pd.concat(
-        pieces,
-        ignore_index=True
-    )
+    if source_pieces:
+        source_rows = pd.concat(
+            source_pieces,
+            ignore_index=True
+        )
+    else:
+        source_rows = pd.DataFrame(
+            {
+                "_source_index":
+                    source_indices
+            }
+        )
 
     meta_columns = [
-        '_original_index',
-        '_amount_numeric',
-        'Motivo de selección',
-        'Método',
-        'Tipo_Seleccion',
-        'Estrato'
+        "_source_index",
+        "_original_index",
+        "_amount_numeric",
+        "_source_row_count",
+        "Motivo de selección",
+        "Método",
+        "Tipo_Seleccion",
+        "Estrato"
     ]
 
     meta = selected[
@@ -728,20 +1019,44 @@ def hydrate_streaming_sample(project, selected):
         ]
     ].copy()
 
-    meta['_selection_order'] = np.arange(
-        len(meta)
+    meta["_selection_order"] = np.arange(
+        len(meta),
+        dtype=np.int64
     )
 
     sample = source_rows.merge(
         meta,
-        on='_original_index',
-        how='inner'
+        on="_source_index",
+        how="right",
+        sort=False
     )
+
+    # Si el monto de origen fue leído como texto, _amount_numeric
+    # conserva exactamente el valor monetario usado en el muestreo.
+    mapping = project.get("mapping") or {}
+    params = project.get("params") or {}
+
+    amount_col = (
+        params.get("amount_col")
+        or mapping.get("amount_col")
+    )
+
+    if (
+        amount_col
+        and amount_col in sample.columns
+        and "_amount_numeric" in sample.columns
+    ):
+        sample[amount_col] = (
+            sample["_amount_numeric"]
+        )
 
     sample = (
         sample
-        .sort_values('_selection_order')
-        .drop(columns=['_selection_order'])
+        .sort_values("_selection_order")
+        .drop(
+            columns=["_selection_order"],
+            errors="ignore"
+        )
         .reset_index(drop=True)
     )
 
@@ -873,19 +1188,181 @@ def parse_amount(series):
             return np.nan
     return cleaned.map(parse_one)
 
-def population_analysis(df, amount_col=None):
-    result = {'records': int(len(df)), 'columns': list(df.columns), 'nulls': {str(k): int(v) for k, v in df.isna().sum().to_dict().items()}, 'duplicate_rows': int(df.duplicated().sum())}
+def population_analysis(
+    df,
+    amount_col=None,
+    id_col=None,
+    source_rows=None,
+    missing_id_rows=0
+):
+    """
+    Analiza la población ya deduplicada por ID + Importe.
+    """
+    records = int(len(df))
+
+    raw_rows = int(
+        source_rows
+        if source_rows is not None
+        else records
+    )
+
+    missing_id_rows = int(
+        missing_id_rows or 0
+    )
+
+    source_duplicate_rows = max(
+        raw_rows
+        - missing_id_rows
+        - records,
+        0
+    )
+
+    unique_ids = (
+        int(
+            df[id_col]
+            .nunique(dropna=True)
+        )
+        if (
+            id_col
+            and id_col in df.columns
+        )
+        else records
+    )
+
+    ids_multiple_amounts = 0
+
+    if (
+        id_col
+        and id_col in df.columns
+        and amount_col
+        and amount_col in df.columns
+    ):
+        per_id = (
+            df
+            .groupby(
+                id_col,
+                dropna=True
+            )[amount_col]
+            .nunique(dropna=False)
+        )
+
+        ids_multiple_amounts = int(
+            (per_id > 1).sum()
+        )
+
+    result = {
+        "records": records,
+        "unique_ids": unique_ids,
+        "source_rows_raw": raw_rows,
+        "source_duplicate_rows": int(
+            source_duplicate_rows
+        ),
+        "missing_id_rows": missing_id_rows,
+        "ids_multiple_amounts": ids_multiple_amounts,
+
+        # El universo utilizado por la muestra ya no contiene
+        # combinaciones ID + Importe duplicadas.
+        "duplicate_rows": 0,
+
+        "columns": list(df.columns),
+        "nulls": {
+            str(key): int(value)
+            for key, value in (
+                df.isna()
+                .sum()
+                .to_dict()
+                .items()
+            )
+        }
+    }
+
     if amount_col and amount_col in df.columns:
-        x = parse_amount(df[amount_col]).dropna()
+        x = (
+            parse_amount(
+                df[amount_col]
+            )
+            .dropna()
+        )
+
         if len(x):
             q1 = x.quantile(0.25)
             q3 = x.quantile(0.75)
             iqr = q3 - q1
+
             lower = q1 - 3 * iqr
             upper = q3 + 3 * iqr
+
             abs_x = x.abs()
-            abs_total = float(abs_x.sum())
-            result.update({'amount_valid': int(len(x)), 'amount_total': float(x.sum()), 'amount_abs_total': abs_total, 'mean': float(x.mean()), 'median': float(x.median()), 'min': float(x.min()), 'max': float(x.max()), 'std': float(x.std(ddof=1)) if len(x) > 1 else 0, 'zeros': int((x == 0).sum()), 'negatives': int((x < 0).sum()), 'outliers': int(((x < lower) | (x > upper)).sum()), 'outlier_lower': float(lower), 'outlier_upper': float(upper), 'top10_pct': float(abs_x.nlargest(min(10, len(abs_x))).sum() / abs_total * 100) if abs_total else 0, 'top20_pct': float(abs_x.nlargest(min(20, len(abs_x))).sum() / abs_total * 100) if abs_total else 0, 'top50_pct': float(abs_x.nlargest(min(50, len(abs_x))).sum() / abs_total * 100) if abs_total else 0})
+            abs_total = float(
+                abs_x.sum()
+            )
+
+            result.update(
+                {
+                    "amount_valid": int(len(x)),
+                    "amount_total": float(x.sum()),
+                    "amount_abs_total": abs_total,
+                    "mean": float(x.mean()),
+                    "median": float(x.median()),
+                    "min": float(x.min()),
+                    "max": float(x.max()),
+                    "std": (
+                        float(x.std(ddof=1))
+                        if len(x) > 1
+                        else 0
+                    ),
+                    "zeros": int((x == 0).sum()),
+                    "negatives": int((x < 0).sum()),
+                    "outliers": int(
+                        (
+                            (x < lower)
+                            | (x > upper)
+                        ).sum()
+                    ),
+                    "outlier_lower": float(lower),
+                    "outlier_upper": float(upper),
+                    "top10_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(10, len(abs_x))
+                            )
+                            .sum()
+                            / abs_total
+                            * 100
+                        )
+                        if abs_total
+                        else 0
+                    ),
+                    "top20_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(20, len(abs_x))
+                            )
+                            .sum()
+                            / abs_total
+                            * 100
+                        )
+                        if abs_total
+                        else 0
+                    ),
+                    "top50_pct": (
+                        float(
+                            abs_x
+                            .nlargest(
+                                min(50, len(abs_x))
+                            )
+                            .sum()
+                            / abs_total
+                            * 100
+                        )
+                        if abs_total
+                        else 0
+                    )
+                }
+            )
+
     return result
 
 def sample_size(N, confidence, error, p):
@@ -974,9 +1451,7 @@ def make_sample(df, params):
         params.get('significant_threshold') or 0
     )
 
-    # La materialidad NO agrega registros por fuera del tamaño n.
-    # El tamaño calculado al inicio es el tamaño final de la muestra.
-    if False and (
+    if (
         params.get('include_materiality')
         and threshold > 0
     ):
@@ -992,8 +1467,7 @@ def make_sample(df, params):
             '100%'
         )
 
-    # Los outliers NO agregan registros por fuera del tamaño n.
-    if False and params.get('include_outliers'):
+    if params.get('include_outliers'):
         available_idx = np.flatnonzero(
             ~excluded
         )
@@ -1353,17 +1827,11 @@ def calculate_extrapolation(project):
     if sample.empty:
         raise ValueError('No existe muestra generada')
 
-    if project.get('source_streaming'):
-        df = analysis_dataframe(
-            project,
-            id_col,
-            amount_col
-        )
-    else:
-        df = project.get('df')
-
-    if df is None:
-        raise ValueError('No existe población cargada')
+    df = analysis_dataframe(
+        project,
+        id_col,
+        amount_col
+    )
 
     if not amount_col or amount_col not in df.columns:
         raise ValueError(
@@ -1943,62 +2411,66 @@ def analyze():
     project = get_project()
     data = request.json or {}
 
-    id_col = data.get('id') or data.get('id_col')
+    id_col = (
+        data.get("id")
+        or data.get("id_col")
+    )
+
     amount_col = (
-        data.get('amount')
-        or data.get('amount_col')
+        data.get("amount")
+        or data.get("amount_col")
     )
 
     if not id_col or not amount_col:
         return jsonify(
-            error='Debe definir las columnas ID e Importe'
+            error="Debe definir las columnas ID e Importe"
         ), 400
 
     try:
-        if project.get('source_streaming'):
-            df = analysis_dataframe(
-                project,
-                id_col,
-                amount_col
-            )
-        else:
-            df = project.get('df')
-
-        if df is None:
-            return jsonify(
-                error='Cargue primero una población'
-            ), 400
-
-        if id_col not in df.columns:
-            return jsonify(
-                error='No se encuentra la columna ID seleccionada'
-            ), 400
-
-        if amount_col not in df.columns:
-            return jsonify(
-                error='No se encuentra la columna Importe seleccionada'
-            ), 400
-
-        project['mapping'] = {
-            'id_col': id_col,
-            'amount_col': amount_col
-        }
-
-        analysis = population_analysis(
-            df,
+        universe = analysis_dataframe(
+            project,
+            id_col,
             amount_col
         )
 
-        project['analysis_cache'] = analysis
-        project['source_rows'] = int(len(df))
+        project["mapping"] = {
+            "id_col": id_col,
+            "amount_col": amount_col
+        }
 
-        if project.get('work_code'):
+        analysis = population_analysis(
+            universe,
+            amount_col,
+            id_col=id_col,
+            source_rows=project.get(
+                "analysis_raw_rows",
+                len(universe)
+            ),
+            missing_id_rows=project.get(
+                "analysis_missing_ids",
+                0
+            )
+        )
+
+        project["analysis_cache"] = analysis
+        project["source_rows"] = int(
+            len(universe)
+        )
+
+        if project.get("work_code"):
             persist_project(
                 project,
-                'Mapeo de población actualizado',
+                "Mapeo de población actualizado",
                 {
-                    'id_col': id_col,
-                    'amount_col': amount_col
+                    "id_col": id_col,
+                    "amount_col": amount_col,
+                    "unique_ids": int(len(universe)),
+                    "source_rows_raw": int(
+                        analysis.get(
+                            "source_rows_raw",
+                            len(universe)
+                        )
+                    )
                 }
             )
 
@@ -2018,7 +2490,7 @@ def analyze():
     except Exception as exc:
         return jsonify(
             error=(
-                'No se pudo analizar la población: '
+                "No se pudo analizar la población: "
                 + str(exc)
             )
         ), 500
@@ -2051,19 +2523,11 @@ def recommend():
         ), 400
 
     try:
-        if project.get('source_streaming'):
-            df = analysis_dataframe(
-                project,
-                id_col,
-                amount_col
-            )
-        else:
-            df = project.get('df')
-
-        if df is None:
-            return jsonify(
-                error='Cargue primero una población'
-            ), 400
+        df = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
 
         analysis = (
             project.get('analysis_cache')
@@ -2167,19 +2631,11 @@ def generate_sample():
     amount_col = data.get('amount_col')
 
     try:
-        if project.get('source_streaming'):
-            df = analysis_dataframe(
-                project,
-                id_col,
-                amount_col
-            )
-        else:
-            df = project.get('df')
-
-        if df is None:
-            return jsonify(
-                error='Cargue primero una población'
-            ), 400
+        df = analysis_dataframe(
+            project,
+            id_col,
+            amount_col
+        )
 
         previous_params = (
             project.get('params', {})
@@ -2200,13 +2656,10 @@ def generate_sample():
             data
         )
 
-        if project.get('source_streaming'):
-            sample = hydrate_streaming_sample(
-                project,
-                selected
-            )
-        else:
-            sample = selected
+        sample = hydrate_streaming_sample(
+            project,
+            selected
+        )
 
         new_signature = selection_signature(
             data,
@@ -2705,3 +3158,4 @@ def export_excel():
             'spreadsheetml.sheet'
         )
     )
+
