@@ -1,4 +1,4 @@
-import os, uuid, math, hashlib, json, gzip, secrets
+import os, uuid, math, hashlib, json, gzip, secrets, pickle
 from datetime import datetime
 from io import BytesIO, StringIO
 import numpy as np
@@ -43,18 +43,58 @@ def json_dumps(value):
 def df_to_blob(df):
     if df is None:
         return None
-    text = df.to_json(orient='split', date_format='iso', force_ascii=False, default_handler=str)
-    compressed = gzip.compress(text.encode('utf-8'), compresslevel=6)
-    return psycopg2.Binary(compressed)
+
+    buffer = BytesIO()
+
+    # Identificador del nuevo formato
+    buffer.write(b'PKL1')
+
+    # Serializa y comprime directamente para evitar
+    # crear un JSON gigante en memoria.
+    with gzip.GzipFile(
+        fileobj=buffer,
+        mode='wb',
+        compresslevel=1
+    ) as gz:
+        pickle.dump(
+            df,
+            gz,
+            protocol=pickle.HIGHEST_PROTOCOL
+        )
+
+    return psycopg2.Binary(
+        buffer.getvalue()
+    )
+
 
 def blob_to_df(blob):
     if blob is None:
         return None
+
     raw = bytes(blob)
+
     if not raw:
         return pd.DataFrame()
+
+    # Nuevo formato: Pickle + Gzip
+    if raw.startswith(b'PKL1'):
+        buffer = BytesIO(raw)
+        buffer.seek(4)
+
+        with gzip.GzipFile(
+            fileobj=buffer,
+            mode='rb'
+        ) as gz:
+            return pickle.load(gz)
+
+    # Compatibilidad con trabajos anteriores
+    # guardados como JSON + Gzip.
     text = gzip.decompress(raw).decode('utf-8')
-    return pd.read_json(StringIO(text), orient='split')
+
+    return pd.read_json(
+        StringIO(text),
+        orient='split'
+    )
 
 def init_db():
     if not database_available():
