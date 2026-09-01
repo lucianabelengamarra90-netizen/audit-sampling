@@ -974,7 +974,9 @@ def make_sample(df, params):
         params.get('significant_threshold') or 0
     )
 
-    if (
+    # La materialidad NO agrega registros por fuera del tamaño n.
+    # El tamaño calculado al inicio es el tamaño final de la muestra.
+    if False and (
         params.get('include_materiality')
         and threshold > 0
     ):
@@ -990,7 +992,8 @@ def make_sample(df, params):
             '100%'
         )
 
-    if params.get('include_outliers'):
+    # Los outliers NO agregan registros por fuera del tamaño n.
+    if False and params.get('include_outliers'):
         available_idx = np.flatnonzero(
             ~excluded
         )
@@ -2702,4 +2705,3 @@ def export_excel():
             'spreadsheetml.sheet'
         )
     )
-
