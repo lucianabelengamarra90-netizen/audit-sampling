@@ -8,7 +8,36 @@ let sample = [];
 let results = {};
 let lastSelectionCode = null;
 let currentWork = null;
+// =========================================================
+// LECTURA SEGURA DE RESPUESTAS JSON
+// =========================================================
 
+async function readJsonResponse(response) {
+
+    const text = await response.text();
+
+    if (!text) {
+        throw new Error(
+            "El servidor cerró la conexión sin devolver respuesta."
+        );
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+
+        console.error(
+            "Respuesta recibida del servidor:",
+            text
+        );
+
+        throw new Error(
+            "Error del servidor (HTTP " +
+            response.status +
+            "). Revisar los logs de Render."
+        );
+    }
+}
 
 // =========================================================
 // NAVEGACIÓN
@@ -1547,7 +1576,7 @@ async function upload(e) {
 
 
         const j =
-            await r.json();
+    await readJsonResponse(r);
 
 
         if (
