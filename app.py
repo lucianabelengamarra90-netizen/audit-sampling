@@ -3371,3 +3371,5 @@ def export_excel():
         )
     )
 
+# Inicializa la base y aplica las migraciones pendientes al arrancar.
+init_db()
